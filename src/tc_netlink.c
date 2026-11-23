@@ -1,263 +1,200 @@
-/*
- * tc_netlink.c  –  Standalone CAKE qdisc management via raw NETLINK_ROUTE
- *
- * Replaces the SQM scripts dependency with in-process netlink calls:
- *
- *   IFB management   –  RTM_NEWLINK / RTM_DELLINK
- *   Qdisc management –  RTM_NEWQDISC / RTM_DELQDISC
- *   Filter/action    –  RTM_NEWTFILTER (u32 match-all + tc_mirred redirect)
- *
- * All messages use the same persistent NETLINK_ROUTE socket opened at
- * startup.  No fork, no exec, no shell, no dependency on tc or ip binaries.
- *
- * References:
- *   iproute2 tc/q_cake.c, tc/f_u32.c, tc/m_mirred.c, ip/link.c
- *   linux/net/sched/sch_cake.c
- *   linux/net/sched/cls_u32.c
- *   linux/net/sched/act_mirred.c
- */
-
+/* CAKE/IFB setup over NETLINK_ROUTE, see iproute2 tc/q_cake.c and tc/f_matchall.c */
 #include "tc_netlink.h"
 
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <errno.h>
 #include <syslog.h>
-#include <limits.h>
+#include <unistd.h>
 
-#include <net/if.h>                   /* if_nametoindex, IFF_UP          */
+#include <arpa/inet.h>
+#include <net/if.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>                /* htons                            */
+#include <sys/time.h>
 
-#include <linux/netlink.h>            /* NETLINK_ROUTE, nlmsghdr          */
-#include <linux/rtnetlink.h>          /* RTM_*, tcmsg, ifinfomsg, TCA_*   */
-#include <linux/if_link.h>            /* IFLA_IFNAME, IFLA_LINKINFO, …    */
-#include <linux/pkt_sched.h>          /* TC_H_ROOT, TC_H_INGRESS, TCA_*   */
-#include <linux/tc_act/tc_mirred.h>   /* TCA_MIRRED_PARMS, TCA_EGRESS_REDIR */
-#include <linux/if_ether.h>           /* ETH_P_ALL                        */
+#include <linux/if_ether.h>
+#include <linux/if_link.h>
+#include <linux/netlink.h>
+#include <linux/pkt_cls.h>
+#include <linux/pkt_sched.h>
+#include <linux/rtnetlink.h>
+#include <linux/tc_act/tc_mirred.h>
 
-/* ── CAKE attribute guards ───────────────────────────────────────────── */
-
-#ifndef TCA_CAKE_BASE_RATE64
-#define TCA_CAKE_BASE_RATE64    2
+#ifndef NETLINK_CAP_ACK
+#define NETLINK_CAP_ACK 10
 #endif
-#ifndef TCA_CAKE_DIFFSERV_MODE
-#define TCA_CAKE_DIFFSERV_MODE  3
-#define TCA_CAKE_ATM            4
-#define TCA_CAKE_FLOW_MODE      5
-#define TCA_CAKE_OVERHEAD       6
-#define TCA_CAKE_RTT            7
-#define TCA_CAKE_TARGET         8
-#define TCA_CAKE_AUTORATE_ING   9
-#define TCA_CAKE_MEMORY         10
-#define TCA_CAKE_NAT            11
-#define TCA_CAKE_WASH           13
-#define TCA_CAKE_MPU            14
-#define TCA_CAKE_INGRESS        15
-#define TCA_CAKE_ACK_FILTER     16
-#define TCA_CAKE_SPLIT_GSO      17
+#ifndef NETLINK_EXT_ACK
+#define NETLINK_EXT_ACK 11
 #endif
-
-/* TC_H_INGRESS might not be in older linux/pkt_sched.h snapshots */
+#ifndef NLM_F_CAPPED
+#define NLM_F_CAPPED 0x100
+#endif
+#ifndef NLM_F_ACK_TLVS
+#define NLM_F_ACK_TLVS 0x200
+#endif
+#ifndef NLMSGERR_ATTR_MSG
+#define NLMSGERR_ATTR_MSG 1
+#endif
 #ifndef TC_H_INGRESS
-#define TC_H_INGRESS  0xFFFFFFF1U
+#define TC_H_INGRESS 0xFFFFFFF1U
 #endif
-
-/* TC_ACT_* may not be present in pkt_cls.h on very old headers */
-#ifndef TC_ACT_STOLEN
-#define TC_ACT_STOLEN  4
-#endif
-
-/* TCA_EGRESS_REDIR: mirred action – redirect to egress of another interface */
-#ifndef TCA_EGRESS_REDIR
-#define TCA_EGRESS_REDIR  1
-#endif
-
-/*
- * TCA_MATCHALL_ACT – the only matchall option we use.
- * matchall is purpose-built for "match every packet"; unlike u32 it has no
- * hash-table lookup and does not inspect packet data at all.
- * Value 2 is stable since kernel 4.12 (linux/pkt_cls.h).
- */
 #ifndef TCA_MATCHALL_ACT
-#define TCA_MATCHALL_ACT  2
+#define TCA_MATCHALL_ACT   2
+#endif
+#ifndef TCA_MATCHALL_FLAGS
+#define TCA_MATCHALL_FLAGS 3
+#endif
+#ifndef TCA_CLS_FLAGS_SKIP_HW
+#define TCA_CLS_FLAGS_SKIP_HW (1 << 0)
 #endif
 
-/* ── Internal state ──────────────────────────────────────────────────── */
+/* TCA_CAKE_* from linux/pkt_sched.h */
+#define CAKE_BASE_RATE64   2
+#define CAKE_DIFFSERV_MODE 3
+#define CAKE_ATM           4
+#define CAKE_FLOW_MODE     5
+#define CAKE_OVERHEAD      6
+#define CAKE_RTT           7
+#define CAKE_MEMORY        10
+#define CAKE_NAT           11
+#define CAKE_WASH          13
+#define CAKE_MPU           14
+#define CAKE_INGRESS       15
+#define CAKE_ACK_FILTER    16
+#define CAKE_SPLIT_GSO     17
 
-/*
- * Cache the qdisc opts per interface so that the emergency
- * fallback "add" path in tc_cake_set_bandwidth() can recreate the qdisc
- * with all CAKE options preserved (diffserv, flow mode, NAT, wash, etc.)
- * rather than a bare bandwidth-only qdisc.
- *
- * We store up to NL_CACHED_IFACES (ifindex, opts) pairs.  In practice
- * the daemon uses at most 2 (DL IFB + UL WAN).
- */
-#define NL_CACHED_IFACES 4
+#define INGRESS_HANDLE 0xFFFF0000U
+#define BUF_SIZE  2048
+#define RECV_SIZE 8192
 
 struct tc_nl_ctx {
     int      fd;
     uint32_t seq;
-
-    /* Per-interface opts cache (populated by tc_dl_setup / tc_ul_setup) */
-    unsigned int      cached_ifindex[NL_CACHED_IFACES];
-    cake_qdisc_opts_t cached_opts[NL_CACHED_IFACES];
-    int               cached_count;
+    char     err[160];
 };
 
-/* ── Buffer sizes ────────────────────────────────────────────────────── */
+struct msg {
+    char buf[BUF_SIZE] __attribute__((aligned(NLMSG_ALIGNTO)));
+    int  len;
+};
 
-/*
- * 1024 bytes is generous for all message types we send.
- * Largest is the u32 mirred filter (~400 bytes incl. all nesting).
- */
-#define NL_BUF_SIZE   1024
-#define NL_RECV_SIZE   512
-
-/* ── Low-level nlattr helpers ────────────────────────────────────────── */
-
-static void nl_put_attr(char *buf, int *pos,
-                        uint16_t type, const void *data, uint16_t dlen)
+static void *msg_init(struct msg *m, uint16_t type, uint16_t flags, size_t hdrlen)
 {
-    struct nlattr *nla = (struct nlattr *)(buf + *pos);
-    nla->nla_type = type;
-    nla->nla_len  = (uint16_t)(NLA_HDRLEN + dlen);
-    if (dlen && data)
-        memcpy((char *)nla + NLA_HDRLEN, data, dlen);
-    int pad = (int)NLA_ALIGN(nla->nla_len) - nla->nla_len;
-    if (pad > 0)
-        memset((char *)nla + nla->nla_len, 0, pad);
-    *pos += (int)NLA_ALIGN(nla->nla_len);
+    memset(m, 0, sizeof(*m));
+    struct nlmsghdr *n = (struct nlmsghdr *)m->buf;
+    n->nlmsg_type = type;
+    n->nlmsg_flags = (uint16_t)(NLM_F_REQUEST | NLM_F_ACK | flags);
+    m->len = (int)(NLMSG_HDRLEN + NLMSG_ALIGN(hdrlen));
+    return m->buf + NLMSG_HDRLEN;
 }
 
-static void nl_put_u32(char *buf, int *pos, uint16_t type, uint32_t val)
+static void put_attr(struct msg *m, uint16_t type, const void *data, size_t dlen)
 {
-    nl_put_attr(buf, pos, type, &val, sizeof(val));
+    struct nlattr *a = (struct nlattr *)(m->buf + m->len);
+    size_t total = NLA_ALIGN(NLA_HDRLEN + dlen);
+    if ((size_t)m->len + total > sizeof(m->buf))
+        return;
+    a->nla_type = type;
+    a->nla_len = (uint16_t)(NLA_HDRLEN + dlen);
+    if (dlen)
+        memcpy((char *)a + NLA_HDRLEN, data, dlen);
+    m->len += (int)total;
 }
 
-static void nl_put_s32(char *buf, int *pos, uint16_t type, int32_t val)
-{
-    nl_put_attr(buf, pos, type, &val, sizeof(val));
-}
+static void put_u32(struct msg *m, uint16_t t, uint32_t v) { put_attr(m, t, &v, 4); }
+static void put_s32(struct msg *m, uint16_t t, int32_t v)  { put_attr(m, t, &v, 4); }
+static void put_u64(struct msg *m, uint16_t t, uint64_t v) { put_attr(m, t, &v, 8); }
+static void put_str(struct msg *m, uint16_t t, const char *s) { put_attr(m, t, s, strlen(s) + 1); }
 
-static void nl_put_u64(char *buf, int *pos, uint16_t type, uint64_t val)
+static int nest_start(struct msg *m, uint16_t type)
 {
-    nl_put_attr(buf, pos, type, &val, sizeof(val));
-}
-
-static void nl_put_str(char *buf, int *pos, uint16_t type, const char *s)
-{
-    nl_put_attr(buf, pos, type, s, (uint16_t)(strlen(s) + 1));
-}
-
-static int nl_nest_start(char *buf, int *pos, uint16_t type)
-{
-    int off = *pos;
-    struct nlattr *nla = (struct nlattr *)(buf + off);
-    nla->nla_type = type | NLA_F_NESTED;
-    nla->nla_len  = NLA_HDRLEN;
-    *pos += NLA_HDRLEN;
+    int off = m->len;
+    put_attr(m, type | NLA_F_NESTED, NULL, 0);
     return off;
 }
 
-static void nl_nest_end(char *buf, int *pos, int nest_off)
+static void nest_end(struct msg *m, int off)
 {
-    struct nlattr *nla = (struct nlattr *)(buf + nest_off);
-    nla->nla_len = (uint16_t)(*pos - nest_off);
+    struct nlattr *a = (struct nlattr *)(m->buf + off);
+    a->nla_len = (uint16_t)(m->len - off);
 }
 
-/* ── Core transact helper ────────────────────────────────────────────── */
+typedef void (*reply_cb_t)(const struct nlmsghdr *n, void *arg);
 
-/*
- * nl_transact – patch message length + seq, send, receive ACK.
- *
- * Returns  0       success
- *         -errno   kernel error (errno also set)
- *         -1       local send/recv error (errno set)
- */
-static int nl_transact(tc_nl_ctx_t *ctx, char *buf, int msg_len)
+static void set_err(tc_nl_ctx_t *ctx, int err, const char *ext)
 {
-    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_len = (uint32_t)msg_len;
-    nlh->nlmsg_seq = ctx->seq++;
-    nlh->nlmsg_pid = 0;
+    if (ext && ext[0])
+        snprintf(ctx->err, sizeof(ctx->err), "%s (%s)", ext, strerror(err));
+    else
+        snprintf(ctx->err, sizeof(ctx->err), "%s", strerror(err));
+}
 
-    struct sockaddr_nl dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.nl_family = AF_NETLINK;
+static void parse_extack(tc_nl_ctx_t *ctx, const struct nlmsghdr *n, int err)
+{
+    const struct nlmsgerr *e = NLMSG_DATA(n);
+    const char *ext = NULL;
 
-    if (sendto(ctx->fd, buf, (size_t)msg_len, 0,
-               (struct sockaddr *)&dst, sizeof(dst)) < 0)
-        return -1;
+    if (n->nlmsg_flags & NLM_F_ACK_TLVS) {
+        size_t off = sizeof(*e);
+        if (!(n->nlmsg_flags & NLM_F_CAPPED))
+            off += e->msg.nlmsg_len - NLMSG_HDRLEN;
+        const char *p = (const char *)e + off;
+        const char *end = (const char *)n + n->nlmsg_len;
+        while (p + NLA_HDRLEN <= end) {
+            const struct nlattr *a = (const struct nlattr *)p;
+            if (a->nla_len < NLA_HDRLEN || p + a->nla_len > end)
+                break;
+            if ((a->nla_type & NLA_TYPE_MASK) == NLMSGERR_ATTR_MSG)
+                ext = p + NLA_HDRLEN;
+            p += NLA_ALIGN(a->nla_len);
+        }
+    }
+    set_err(ctx, err, ext);
+}
 
-    /*
-     * Loop until we receive the ACK for *our* sequence number.
-     * An unsolicited netlink notification (link-up/down event, kernel
-     * route change) arriving before the ACK would otherwise be silently
-     * parsed as our response, corrupting the return value.
-     */
-    uint32_t sent_seq = nlh->nlmsg_seq;
-    char rbuf[NL_RECV_SIZE];
+/* returns 0 or -errno */
+static int nl_talk(tc_nl_ctx_t *ctx, struct msg *m, reply_cb_t cb, void *arg)
+{
+    struct nlmsghdr *req = (struct nlmsghdr *)m->buf;
+    req->nlmsg_len = (uint32_t)m->len;
+    req->nlmsg_seq = ++ctx->seq;
+
+    struct sockaddr_nl dst = { .nl_family = AF_NETLINK };
+    if (sendto(ctx->fd, m->buf, (size_t)m->len, 0, (struct sockaddr *)&dst, sizeof(dst)) < 0) {
+        int e = errno;
+        set_err(ctx, e, "netlink send failed");
+        return -e;
+    }
+
+    static char rbuf[RECV_SIZE] __attribute__((aligned(NLMSG_ALIGNTO)));
     for (;;) {
-        ssize_t n = recv(ctx->fd, rbuf, sizeof(rbuf), 0);
-        if (n < (ssize_t)NLMSG_HDRLEN)
-            return -1;
-
-        struct nlmsghdr *ack = (struct nlmsghdr *)rbuf;
-
-        /* Discard any message that isn't our ACK */
-        if (ack->nlmsg_seq != sent_seq)
-            continue;
-
-        if (ack->nlmsg_type != NLMSG_ERROR)
-            return -1;
-        if ((size_t)n < NLMSG_HDRLEN + sizeof(struct nlmsgerr))
-            return -1;
-
-        struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(ack);
-        if (err->error != 0) {
-            errno = -err->error;
-            return err->error;   /* negative errno */
+        ssize_t r = recv(ctx->fd, rbuf, sizeof(rbuf), 0);
+        if (r < 0) {
+            int e = errno;
+            if (e == EINTR)
+                continue;
+            set_err(ctx, e, "netlink receive failed");
+            return -e;
         }
-        return 0;
-    }
-}
-
-/* ── Socket lifecycle ────────────────────────────────────────────────── */
-
-/* Store opts for an interface, replacing any existing entry for that ifindex */
-static void tc__cache_opts(tc_nl_ctx_t *ctx, unsigned int ifindex,
-                            const cake_qdisc_opts_t *opts)
-{
-    if (!opts) return;
-
-    /* Update existing entry if present */
-    for (int i = 0; i < ctx->cached_count; i++) {
-        if (ctx->cached_ifindex[i] == ifindex) {
-            ctx->cached_opts[i] = *opts;
-            return;
+        for (struct nlmsghdr *n = (struct nlmsghdr *)rbuf; NLMSG_OK(n, (size_t)r);
+             n = NLMSG_NEXT(n, r)) {
+            if (n->nlmsg_seq != req->nlmsg_seq)
+                continue;
+            if (n->nlmsg_type == NLMSG_DONE)
+                return 0;
+            if (n->nlmsg_type == NLMSG_ERROR) {
+                const struct nlmsgerr *e = NLMSG_DATA(n);
+                if (e->error == 0)
+                    return 0;
+                parse_extack(ctx, n, -e->error);
+                return e->error;
+            }
+            if (cb)
+                cb(n, arg);
         }
     }
-
-    /* Add new entry if there is room */
-    if (ctx->cached_count < NL_CACHED_IFACES) {
-        ctx->cached_ifindex[ctx->cached_count] = ifindex;
-        ctx->cached_opts[ctx->cached_count]    = *opts;
-        ctx->cached_count++;
-    }
-}
-
-/* Look up cached opts for an ifindex; returns NULL if not found */
-static const cake_qdisc_opts_t *tc__lookup_opts(const tc_nl_ctx_t *ctx,
-                                                  unsigned int ifindex)
-{
-    for (int i = 0; i < ctx->cached_count; i++) {
-        if (ctx->cached_ifindex[i] == ifindex)
-            return &ctx->cached_opts[i];
-    }
-    return NULL;
 }
 
 tc_nl_ctx_t *tc_nl_open(void)
@@ -268,23 +205,24 @@ tc_nl_ctx_t *tc_nl_open(void)
 
     ctx->fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     if (ctx->fd < 0) {
-        syslog(LOG_ERR, "tc_netlink: socket(): %m");
+        syslog(LOG_ERR, "netlink: socket(): %m");
         free(ctx);
         return NULL;
     }
 
-    struct sockaddr_nl sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.nl_family = AF_NETLINK;
+    int one = 1;
+    setsockopt(ctx->fd, SOL_NETLINK, NETLINK_EXT_ACK, &one, sizeof(one));
+    setsockopt(ctx->fd, SOL_NETLINK, NETLINK_CAP_ACK, &one, sizeof(one));
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
     if (bind(ctx->fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        syslog(LOG_ERR, "tc_netlink: bind(): %m");
+        syslog(LOG_ERR, "netlink: bind(): %m");
         close(ctx->fd);
         free(ctx);
         return NULL;
     }
-
-    ctx->seq = 1;
     return ctx;
 }
 
@@ -296,604 +234,390 @@ void tc_nl_close(tc_nl_ctx_t *ctx)
     free(ctx);
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * Link management helpers (IFB create / set-up / delete)
- * ════════════════════════════════════════════════════════════════════════ */
-
-/*
- * tc__link_create_ifb  –  RTM_NEWLINK + NLM_F_CREATE|NLM_F_EXCL
- *
- * Equivalent to:  ip link add <name> type ifb
- * Returns 0 on success, -EEXIST if already present, other -errno on error.
- */
-static int tc__link_create_ifb(tc_nl_ctx_t *ctx, const char *name)
+const char *tc_nl_last_error(tc_nl_ctx_t *ctx)
 {
-    char buf[NL_BUF_SIZE];
-    memset(buf, 0, sizeof(buf));
-
-    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_type  = RTM_NEWLINK;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
-
-    int pos = NLMSG_HDRLEN;
-
-    struct ifinfomsg *ifi = (struct ifinfomsg *)(buf + pos);
-    ifi->ifi_family = AF_UNSPEC;
-    pos += (int)NLMSG_ALIGN(sizeof(*ifi));
-
-    nl_put_str(buf, &pos, IFLA_IFNAME, name);
-
-    /* IFLA_LINKINFO { IFLA_INFO_KIND = "ifb" } */
-    int li = nl_nest_start(buf, &pos, IFLA_LINKINFO);
-    nl_put_str(buf, &pos, IFLA_INFO_KIND, "ifb");
-    nl_nest_end(buf, &pos, li);
-
-    return nl_transact(ctx, buf, pos);
+    return ctx ? ctx->err : "";
 }
 
-/*
- * tc__link_set_up  –  bring an interface UP via RTM_NEWLINK.
- *
- * Equivalent to:  ip link set <name> up
- */
-static int tc__link_set_up(tc_nl_ctx_t *ctx, const char *name)
+struct kind_arg { char kind[32]; int found; };
+
+static void link_kind_cb(const struct nlmsghdr *n, void *arg)
 {
-    unsigned int ifindex = if_nametoindex(name);
-    if (!ifindex) {
-        errno = ENODEV;
-        return -1;
-    }
-
-    char buf[NL_BUF_SIZE];
-    memset(buf, 0, sizeof(buf));
-
-    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_type  = RTM_NEWLINK;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-
-    int pos = NLMSG_HDRLEN;
-
-    struct ifinfomsg *ifi = (struct ifinfomsg *)(buf + pos);
-    ifi->ifi_family  = AF_UNSPEC;
-    ifi->ifi_index   = (int)ifindex;
-    ifi->ifi_flags   = IFF_UP;
-    ifi->ifi_change  = IFF_UP;
-    pos += (int)NLMSG_ALIGN(sizeof(*ifi));
-
-    return nl_transact(ctx, buf, pos);
-}
-
-/*
- * tc__link_delete  –  RTM_DELLINK.
- *
- * Equivalent to:  ip link del <name>
- * Silently returns 0 if the interface does not exist.
- */
-static int tc__link_delete(tc_nl_ctx_t *ctx, const char *name)
-{
-    unsigned int ifindex = if_nametoindex(name);
-    if (!ifindex)
-        return 0;   /* already gone */
-
-    char buf[NL_BUF_SIZE];
-    memset(buf, 0, sizeof(buf));
-
-    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_type  = RTM_DELLINK;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-
-    int pos = NLMSG_HDRLEN;
-
-    struct ifinfomsg *ifi = (struct ifinfomsg *)(buf + pos);
-    ifi->ifi_family = AF_UNSPEC;
-    ifi->ifi_index  = (int)ifindex;
-    pos += (int)NLMSG_ALIGN(sizeof(*ifi));
-
-    int ret = nl_transact(ctx, buf, pos);
-    return (ret == -ENODEV || ret == -ENOENT) ? 0 : ret;
-}
-
-/* ════════════════════════════════════════════════════════════════════════
- * CAKE qdisc helpers
- * ════════════════════════════════════════════════════════════════════════ */
-
-/*
- * Build the TCA_OPTIONS nested attribute block for CAKE with all opts.
- * Called by both the "add" and "change" paths.
- */
-static void tc__cake_fill_opts(char *buf, int *pos,
-                               uint64_t rate_Bps,
-                               const cake_qdisc_opts_t *opts)
-{
-    int o = nl_nest_start(buf, pos, TCA_OPTIONS);
-
-    nl_put_u64(buf, pos, TCA_CAKE_BASE_RATE64, rate_Bps);
-
-    if (opts) {
-        nl_put_u32(buf, pos, TCA_CAKE_DIFFSERV_MODE, opts->diffserv);
-        nl_put_u32(buf, pos, TCA_CAKE_ATM,           opts->atm);
-        nl_put_u32(buf, pos, TCA_CAKE_FLOW_MODE,     opts->flow_mode);
-
-        /* overhead: omit if INT32_MIN (let CAKE keep its default of 0) */
-        if (opts->overhead != INT32_MIN)
-            nl_put_s32(buf, pos, TCA_CAKE_OVERHEAD, opts->overhead);
-
-        if (opts->mpu)
-            nl_put_u32(buf, pos, TCA_CAKE_MPU, opts->mpu);
-
-        nl_put_u32(buf, pos, TCA_CAKE_NAT,        opts->nat);
-        nl_put_u32(buf, pos, TCA_CAKE_WASH,        opts->wash);
-        nl_put_u32(buf, pos, TCA_CAKE_INGRESS,     opts->ingress);
-        nl_put_u32(buf, pos, TCA_CAKE_ACK_FILTER,  opts->ack_filter);
-        nl_put_u32(buf, pos, TCA_CAKE_SPLIT_GSO,   opts->split_gso);
-
-        if (opts->rtt_us)
-            nl_put_u32(buf, pos, TCA_CAKE_RTT, opts->rtt_us);
-    }
-
-    nl_nest_end(buf, pos, o);
-}
-
-/*
- * tc__cake_qdisc_op  –  send one RTM_NEWQDISC for CAKE.
- *
- *   nl_flags = 0                            → qdisc change (modify in-place)
- *   nl_flags = NLM_F_CREATE | NLM_F_EXCL   → qdisc add   (new qdisc)
- *   nl_flags = NLM_F_CREATE                 → qdisc replace
- */
-static int tc__cake_qdisc_op(tc_nl_ctx_t *ctx,
-                              unsigned int ifindex, uint32_t parent,
-                              uint64_t rate_Bps,
-                              const cake_qdisc_opts_t *opts,
-                              uint16_t nl_flags)
-{
-    char buf[NL_BUF_SIZE];
-    memset(buf, 0, sizeof(buf));
-
-    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_type  = RTM_NEWQDISC;
-    nlh->nlmsg_flags = (uint16_t)(NLM_F_REQUEST | NLM_F_ACK | nl_flags);
-
-    int pos = NLMSG_HDRLEN;
-
-    struct tcmsg *tc = (struct tcmsg *)(buf + pos);
-    tc->tcm_family  = AF_UNSPEC;
-    tc->tcm_ifindex = (int)ifindex;
-    tc->tcm_handle  = 0;
-    tc->tcm_parent  = parent;
-    pos += (int)NLMSG_ALIGN(sizeof(*tc));
-
-    /* Select qdisc kind: "cake-mq" (OpenWrt 25.12+) or "cake" */
-    const char *kind = (opts && opts->use_cake_mq) ? "cake-mq" : "cake";
-    nl_put_str(buf, &pos, TCA_KIND, kind);
-    tc__cake_fill_opts(buf, &pos, rate_Bps, opts);
-
-    return nl_transact(ctx, buf, pos);
-}
-
-/*
- * tc__qdisc_del  –  RTM_DELQDISC for any qdisc type.
- * Silently returns 0 for ENOENT / EINVAL (qdisc not present).
- */
-static int tc__qdisc_del(tc_nl_ctx_t *ctx,
-                          unsigned int ifindex,
-                          uint32_t parent, uint32_t handle)
-{
-    char buf[NL_BUF_SIZE];
-    memset(buf, 0, sizeof(buf));
-
-    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_type  = RTM_DELQDISC;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-
-    int pos = NLMSG_HDRLEN;
-
-    struct tcmsg *tc = (struct tcmsg *)(buf + pos);
-    tc->tcm_family  = AF_UNSPEC;
-    tc->tcm_ifindex = (int)ifindex;
-    tc->tcm_handle  = handle;
-    tc->tcm_parent  = parent;
-    pos += (int)NLMSG_ALIGN(sizeof(*tc));
-
-    int ret = nl_transact(ctx, buf, pos);
-    if (ret == -ENOENT || ret == -EINVAL)
-        return 0;
-    return ret;
-}
-
-/* ════════════════════════════════════════════════════════════════════════
- * Ingress qdisc
- * ════════════════════════════════════════════════════════════════════════ */
-
-/*
- * tc__ingress_add  –  attach the clsact/ingress qdisc to <ifindex>.
- *
- * Equivalent to:  tc qdisc add dev <if> ingress
- */
-static int tc__ingress_add(tc_nl_ctx_t *ctx, unsigned int ifindex)
-{
-    char buf[NL_BUF_SIZE];
-    memset(buf, 0, sizeof(buf));
-
-    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_type  = RTM_NEWQDISC;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
-
-    int pos = NLMSG_HDRLEN;
-
-    struct tcmsg *tc = (struct tcmsg *)(buf + pos);
-    tc->tcm_family  = AF_UNSPEC;
-    tc->tcm_ifindex = (int)ifindex;
-    tc->tcm_handle  = 0xFFFF0000U;   /* standard ingress handle */
-    tc->tcm_parent  = TC_H_INGRESS;
-    pos += (int)NLMSG_ALIGN(sizeof(*tc));
-
-    nl_put_str(buf, &pos, TCA_KIND, "ingress");
-
-    int ret = nl_transact(ctx, buf, pos);
-    if (ret == -EEXIST)
-        return 0;   /* already present is fine */
-    return ret;
-}
-
-/*
- * tc__ingress_del  –  remove the ingress qdisc from <ifindex>.
- * Silently succeeds if not present.
- */
-static int tc__ingress_del(tc_nl_ctx_t *ctx, unsigned int ifindex)
-{
-    return tc__qdisc_del(ctx, ifindex, TC_H_INGRESS, 0xFFFF0000U);
-}
-
-/* ════════════════════════════════════════════════════════════════════════
- * matchall + mirred egress redirect filter
- * ════════════════════════════════════════════════════════════════════════ */
-
-/*
- * tc__mirred_filter_add  –  attach a matchall filter on the ingress qdisc
- * of <src_ifindex> that redirects all traffic to <dst_ifindex>.
- *
- * We use the "matchall" classifier (cls_matchall, kernel 4.12+) rather than
- * "u32 match u32 0 0" because:
- *   • matchall is purpose-built for this exact use case
- *   • it never inspects packet data and has no hash-table overhead
- *   • u32's implicit hash-table creation can silently mis-match on some
- *     kernel configs, leaving the ingress qdisc with no active filter
- *     (which is exactly the symptom: IFB tx_bytes stays at 0)
- *
- * Equivalent tc command:
- *   tc filter add dev <src> parent ffff: protocol all \
- *       matchall action mirred egress redirect dev <dst>
- */
-static int tc__mirred_filter_add(tc_nl_ctx_t *ctx,
-                                  unsigned int src_ifindex,
-                                  unsigned int dst_ifindex)
-{
-    char buf[NL_BUF_SIZE];
-    memset(buf, 0, sizeof(buf));
-
-    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_type  = RTM_NEWTFILTER;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
-
-    int pos = NLMSG_HDRLEN;
-
-    struct tcmsg *tc = (struct tcmsg *)(buf + pos);
-    tc->tcm_family  = AF_UNSPEC;
-    tc->tcm_ifindex = (int)src_ifindex;
-    tc->tcm_handle  = 0;
-    tc->tcm_parent  = 0xFFFF0000U;   /* ingress qdisc handle ffff: */
-    /*
-     * tcm_info encodes (prio << 16) | protocol (network byte order).
-     * protocol = ETH_P_ALL = 0x0003, must be big-endian in this field.
-     */
-    tc->tcm_info = TC_H_MAKE(1U << 16, (uint32_t)htons(ETH_P_ALL));
-    pos += (int)NLMSG_ALIGN(sizeof(*tc));
-
-    /* ── Classifier: matchall ────────────────────────────────────── */
-    nl_put_str(buf, &pos, TCA_KIND, "matchall");
-
-    int opts = nl_nest_start(buf, &pos, TCA_OPTIONS);
-
-    /* ── Action list nested inside TCA_OPTIONS ───────────────────── */
-    int act_list = nl_nest_start(buf, &pos, TCA_MATCHALL_ACT);
-    int act1     = nl_nest_start(buf, &pos, 1);  /* first action slot */
-
-    nl_put_str(buf, &pos, TCA_ACT_KIND, "mirred");
-
-    int mact_opts = nl_nest_start(buf, &pos, TCA_ACT_OPTIONS);
-
-    /*
-     * struct tc_mirred wire layout (kernel UAPI, linux/tc_act/tc_mirred.h):
-     *   uint32  index    – 0 = kernel assigns
-     *   uint32  capab    – 0
-     *   int32   action   – TC_ACT_STOLEN (4): packet is consumed by the action
-     *   int32   refcnt   – 0
-     *   int32   bindcnt  – 0
-     *   int32   eaction  – TCA_EGRESS_REDIR (1)
-     *   uint32  ifindex  – destination interface
-     */
-    struct {
-        uint32_t index;
-        uint32_t capab;
-        int32_t  action;
-        int32_t  refcnt;
-        int32_t  bindcnt;
-        int32_t  eaction;
-        uint32_t ifindex;
-    } mp;
-    memset(&mp, 0, sizeof(mp));
-    mp.action  = TC_ACT_STOLEN;
-    mp.eaction = TCA_EGRESS_REDIR;
-    mp.ifindex = dst_ifindex;
-
-    nl_put_attr(buf, &pos, TCA_MIRRED_PARMS, &mp, sizeof(mp));
-
-    nl_nest_end(buf, &pos, mact_opts);
-    nl_nest_end(buf, &pos, act1);
-    nl_nest_end(buf, &pos, act_list);
-    nl_nest_end(buf, &pos, opts);
-
-    int ret = nl_transact(ctx, buf, pos);
-    if (ret == -EEXIST)
-        return 0;
-    return ret;
-}
-
-/* ════════════════════════════════════════════════════════════════════════
- * Public: runtime rate control
- * ════════════════════════════════════════════════════════════════════════ */
-
-int tc_cake_set_bandwidth(tc_nl_ctx_t *ctx,
-                          const char  *iface,
-                          uint32_t     rate_kbps)
-{
-    if (!ctx || !iface || !iface[0]) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    unsigned int ifindex = if_nametoindex(iface);
-    if (!ifindex) {
-        syslog(LOG_WARNING, "tc_netlink: unknown interface '%s'", iface);
-        errno = ENODEV;
-        return -1;
-    }
-
-    /* kbps → bytes/sec: kbps * 1000 / 8 = kbps * 125 */
-    uint64_t rate_Bps = (uint64_t)rate_kbps * 125ULL;
-
-    /* Modify existing root CAKE qdisc in-place (no NLM_F_CREATE). */
-    int ret = tc__cake_qdisc_op(ctx, ifindex, TC_H_ROOT, rate_Bps, NULL, 0);
-    if (ret == 0)
-        return 0;
-
-    /*
-     * Use cached opts so all CAKE options (diffserv, flow mode,
-     * NAT, wash, overhead, etc.) are preserved – not just the rate.
-     */
-    if (errno == ENOENT) {
-        const cake_qdisc_opts_t *saved = tc__lookup_opts(ctx, ifindex);
-        ret = tc__cake_qdisc_op(ctx, ifindex, TC_H_ROOT, rate_Bps, saved,
-                                NLM_F_CREATE | NLM_F_EXCL);
-        if (ret == 0)
-            return 0;
-    }
-
-    syslog(LOG_WARNING,
-           "tc_netlink: failed to set CAKE bandwidth on '%s' to %u kbps: %m",
-           iface, rate_kbps);
-    return -1;
-}
-
-/* ════════════════════════════════════════════════════════════════════════
- * Public: download path lifecycle
- * ════════════════════════════════════════════════════════════════════════ */
-
-int tc_dl_setup(tc_nl_ctx_t            *ctx,
-                const char             *wan_if,
-                const char             *ifb_if,
-                uint32_t                rate_kbps,
-                const cake_qdisc_opts_t *opts_dl)
-{
-    if (!ctx || !wan_if || !wan_if[0] || !ifb_if || !ifb_if[0]) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    int ret;
-    uint64_t rate_Bps = (uint64_t)rate_kbps * 125ULL;
-
-    /* ── 1. Create IFB interface ─────────────────────────────── */
-    ret = tc__link_create_ifb(ctx, ifb_if);
-    if (ret < 0 && errno != EEXIST) {
-        syslog(LOG_ERR, "tc_dl_setup: create IFB '%s': %m", ifb_if);
-        return -1;
-    }
-
-    /* ── 2. Bring IFB up ─────────────────────────────────────── */
-    ret = tc__link_set_up(ctx, ifb_if);
-    if (ret < 0) {
-        syslog(LOG_ERR, "tc_dl_setup: set IFB '%s' up: %m", ifb_if);
-        return -1;
-    }
-
-    unsigned int ifb_idx = if_nametoindex(ifb_if);
-    unsigned int wan_idx = if_nametoindex(wan_if);
-    if (!ifb_idx || !wan_idx) {
-        syslog(LOG_ERR, "tc_dl_setup: interface lookup failed");
-        return -1;
-    }
-
-    /* ── 3. CAKE root qdisc on IFB ───────────────────────────── */
-    /*
-     * Try change first; if absent, add.  This makes setup idempotent
-     * if the daemon is restarted without a full teardown.
-     *
-     * If cake-mq was requested but the module isn't loaded, the kernel
-     * returns ENOENT on the create attempt.  In that case we transparently
-     * fall back to standard CAKE so the daemon still functions correctly.
-     */
-    ret = tc__cake_qdisc_op(ctx, ifb_idx, TC_H_ROOT, rate_Bps, opts_dl, 0);
-    if (ret < 0 && errno == ENOENT)
-        ret = tc__cake_qdisc_op(ctx, ifb_idx, TC_H_ROOT, rate_Bps, opts_dl,
-                                NLM_F_CREATE | NLM_F_EXCL);
-    if (ret < 0 && errno == ENOENT && opts_dl && opts_dl->use_cake_mq) {
-        syslog(LOG_WARNING,
-               "tc_dl_setup: cake-mq not available on '%s', falling back to cake",
-               ifb_if);
-        cake_qdisc_opts_t fallback = *opts_dl;
-        fallback.use_cake_mq = 0;
-        ret = tc__cake_qdisc_op(ctx, ifb_idx, TC_H_ROOT, rate_Bps, &fallback,
-                                NLM_F_CREATE | NLM_F_EXCL);
-    }
-    if (ret < 0 && errno != EEXIST) {
-        syslog(LOG_ERR, "tc_dl_setup: CAKE qdisc on '%s': %m", ifb_if);
-        return -1;
-    }
-
-    /* Cache the DL opts so tc_cake_set_bandwidth fallback can use them */
-    if (opts_dl)
-        tc__cache_opts(ctx, ifb_idx, opts_dl);
-
-    /* ── 4. Ingress qdisc on WAN ─────────────────────────────── */
-    ret = tc__ingress_add(ctx, wan_idx);
-    if (ret < 0) {
-        syslog(LOG_ERR, "tc_dl_setup: ingress qdisc on '%s': %m", wan_if);
-        return -1;
-    }
-
-    /* ── 5. u32 match-all + mirred redirect WAN → IFB ───────── */
-    ret = tc__mirred_filter_add(ctx, wan_idx, ifb_idx);
-    if (ret < 0) {
-        syslog(LOG_ERR, "tc_dl_setup: mirred filter '%s'→'%s': %m",
-               wan_if, ifb_if);
-        return -1;
-    }
-
-    syslog(LOG_INFO, "tc_dl_setup: DL path ready (%s→%s @ %u kbps)",
-           wan_if, ifb_if, rate_kbps);
-    return 0;
-}
-
-void tc_dl_teardown(tc_nl_ctx_t *ctx,
-                    const char  *wan_if,
-                    const char  *ifb_if)
-{
-    if (!ctx)
+    struct kind_arg *ka = arg;
+    if (n->nlmsg_type != RTM_NEWLINK)
         return;
+    ka->found = 1;
 
-    /* Filters are removed automatically when the ingress qdisc is deleted. */
-
-    if (wan_if && wan_if[0]) {
-        unsigned int wan_idx = if_nametoindex(wan_if);
-        if (wan_idx)
-            tc__ingress_del(ctx, wan_idx);
+    const struct ifinfomsg *ifi = NLMSG_DATA(n);
+    int len = (int)n->nlmsg_len - (int)NLMSG_LENGTH(sizeof(*ifi));
+    const struct rtattr *rta = IFLA_RTA(ifi);
+    for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
+        if (rta->rta_type != IFLA_LINKINFO)
+            continue;
+        int ilen = (int)RTA_PAYLOAD(rta);
+        const struct rtattr *in = RTA_DATA(rta);
+        for (; RTA_OK(in, ilen); in = RTA_NEXT(in, ilen)) {
+            if (in->rta_type == IFLA_INFO_KIND)
+                snprintf(ka->kind, sizeof(ka->kind), "%s", (const char *)RTA_DATA(in));
+        }
     }
-
-    if (ifb_if && ifb_if[0]) {
-        unsigned int ifb_idx = if_nametoindex(ifb_if);
-        if (ifb_idx)
-            tc__qdisc_del(ctx, ifb_idx, TC_H_ROOT, 0);
-
-        /* Deleting the IFB link also removes its qdiscs. */
-        tc__link_delete(ctx, ifb_if);
-    }
-
-    syslog(LOG_INFO, "tc_dl_teardown: DL path removed (%s / %s)",
-           wan_if ? wan_if : "?", ifb_if ? ifb_if : "?");
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * Public: upload path lifecycle
- * ════════════════════════════════════════════════════════════════════════ */
-
-int tc_ul_setup(tc_nl_ctx_t            *ctx,
-                const char             *wan_if,
-                uint32_t                rate_kbps,
-                const cake_qdisc_opts_t *opts_ul)
+int tc_link_is_ifb(tc_nl_ctx_t *ctx, const char *name)
 {
-    if (!ctx || !wan_if || !wan_if[0]) {
-        errno = EINVAL;
+    struct msg m;
+    struct ifinfomsg *ifi = msg_init(&m, RTM_GETLINK, 0, sizeof(*ifi));
+    ifi->ifi_family = AF_UNSPEC;
+    put_str(&m, IFLA_IFNAME, name);
+
+    struct kind_arg ka = { .found = 0 };
+    if (nl_talk(ctx, &m, link_kind_cb, &ka) < 0 || !ka.found)
         return -1;
+    return strcmp(ka.kind, "ifb") == 0;
+}
+
+static int link_create_ifb(tc_nl_ctx_t *ctx, const char *name)
+{
+    struct msg m;
+    struct ifinfomsg *ifi = msg_init(&m, RTM_NEWLINK, NLM_F_CREATE | NLM_F_EXCL, sizeof(*ifi));
+    ifi->ifi_family = AF_UNSPEC;
+    put_str(&m, IFLA_IFNAME, name);
+    int li = nest_start(&m, IFLA_LINKINFO);
+    put_str(&m, IFLA_INFO_KIND, "ifb");
+    nest_end(&m, li);
+    return nl_talk(ctx, &m, NULL, NULL);
+}
+
+static int link_set_up(tc_nl_ctx_t *ctx, unsigned int ifindex)
+{
+    struct msg m;
+    struct ifinfomsg *ifi = msg_init(&m, RTM_NEWLINK, 0, sizeof(*ifi));
+    ifi->ifi_family = AF_UNSPEC;
+    ifi->ifi_index = (int)ifindex;
+    ifi->ifi_flags = IFF_UP;
+    ifi->ifi_change = IFF_UP;
+    return nl_talk(ctx, &m, NULL, NULL);
+}
+
+static int link_delete(tc_nl_ctx_t *ctx, const char *name)
+{
+    unsigned int idx = if_nametoindex(name);
+    if (!idx)
+        return 0;
+    struct msg m;
+    struct ifinfomsg *ifi = msg_init(&m, RTM_DELLINK, 0, sizeof(*ifi));
+    ifi->ifi_family = AF_UNSPEC;
+    ifi->ifi_index = (int)idx;
+    int r = nl_talk(ctx, &m, NULL, NULL);
+    return (r == -ENODEV) ? 0 : r;
+}
+
+static struct tcmsg *tc_init(struct msg *m, uint16_t type, uint16_t flags,
+                             unsigned int ifindex, uint32_t parent, uint32_t handle)
+{
+    struct tcmsg *t = msg_init(m, type, flags, sizeof(*t));
+    t->tcm_family = AF_UNSPEC;
+    t->tcm_ifindex = (int)ifindex;
+    t->tcm_parent = parent;
+    t->tcm_handle = handle;
+    return t;
+}
+
+static int qdisc_del(tc_nl_ctx_t *ctx, unsigned int ifindex, uint32_t parent, uint32_t handle)
+{
+    struct msg m;
+    tc_init(&m, RTM_DELQDISC, 0, ifindex, parent, handle);
+    int r = nl_talk(ctx, &m, NULL, NULL);
+    /* EINVAL: default qdisc with handle 0 */
+    return (r == -ENOENT || r == -EINVAL) ? 0 : r;
+}
+
+static uint64_t kbps_to_Bps(uint32_t kbps) { return (uint64_t)kbps * 125u; }
+
+static int cake_add(tc_nl_ctx_t *ctx, unsigned int ifindex, const char *kind,
+                    uint32_t rate_kbps, const cake_opts_t *o)
+{
+    struct msg m;
+    tc_init(&m, RTM_NEWQDISC, NLM_F_CREATE | NLM_F_EXCL, ifindex, TC_H_ROOT, 0);
+    put_str(&m, TCA_KIND, kind);
+
+    int opts = nest_start(&m, TCA_OPTIONS);
+    put_u64(&m, CAKE_BASE_RATE64, kbps_to_Bps(rate_kbps));
+    put_u32(&m, CAKE_DIFFSERV_MODE, o->diffserv);
+    put_u32(&m, CAKE_ATM, o->atm);
+    put_u32(&m, CAKE_FLOW_MODE, o->flow_mode);
+    if (o->overhead != INT32_MIN)
+        put_s32(&m, CAKE_OVERHEAD, o->overhead);
+    if (o->mpu)
+        put_u32(&m, CAKE_MPU, o->mpu);
+    if (o->rtt_us)
+        put_u32(&m, CAKE_RTT, o->rtt_us);
+    if (o->memlimit)
+        put_u32(&m, CAKE_MEMORY, o->memlimit);
+    put_u32(&m, CAKE_NAT, o->nat);
+    put_u32(&m, CAKE_WASH, o->wash);
+    put_u32(&m, CAKE_INGRESS, o->ingress);
+    put_u32(&m, CAKE_ACK_FILTER, o->ack_filter);
+    put_u32(&m, CAKE_SPLIT_GSO, o->split_gso);
+    nest_end(&m, opts);
+
+    return nl_talk(ctx, &m, NULL, NULL);
+}
+
+static int cake_install(tc_nl_ctx_t *ctx, unsigned int ifindex, const char *ifname,
+                        uint32_t rate_kbps, const cake_opts_t *o, const char **kind)
+{
+    int r;
+
+    qdisc_del(ctx, ifindex, TC_H_ROOT, 0);
+
+    if (o->try_cake_mq) {
+        r = cake_add(ctx, ifindex, "cake_mq", rate_kbps, o);
+        if (r == 0) {
+            *kind = "cake_mq";
+            return 0;
+        }
+        syslog(LOG_NOTICE, "%s: cake_mq unavailable (%s), using cake", ifname, ctx->err);
     }
 
-    unsigned int wan_idx = if_nametoindex(wan_if);
-    if (!wan_idx) {
-        syslog(LOG_ERR, "tc_ul_setup: unknown interface '%s'", wan_if);
-        errno = ENODEV;
-        return -1;
+    r = cake_add(ctx, ifindex, "cake", rate_kbps, o);
+    if (r == -EEXIST) {
+        qdisc_del(ctx, ifindex, TC_H_ROOT, 0);
+        r = cake_add(ctx, ifindex, "cake", rate_kbps, o);
     }
-
-    uint64_t rate_Bps = (uint64_t)rate_kbps * 125ULL;
-
-    /*
-     * Always delete any existing root qdisc before creating our CAKE qdisc.
-     *
-     * Rationale: the "change" path (RTM_NEWQDISC without NLM_F_CREATE) is
-     * unreliable for ensuring all CAKE opts are applied when:
-     *  (a) The existing qdisc is a different type (pfifo_fast, fq_codel …)
-     *      – the kernel returns 0 after a no-op or EINVAL, leaving the
-     *        wrong qdisc in place.
-     *  (b) The existing qdisc is CAKE but was created by SQM scripts without
-     *      overhead/MPU – CAKE's cake_change() may not reset already-zero
-     *      fields when the attribute is sent explicitly as 0.
-     *  (c) Wireless interfaces (phy/wlan) on OpenWrt often have a
-     *      per-driver default qdisc that is NOT replaced by a plain "change".
-     *
-     * Deleting first and creating fresh guarantees all opts are always applied.
-     * The brief moment without a shaper during setup is acceptable since this
-     * only runs at daemon start or interface recovery.
-     */
-    tc__qdisc_del(ctx, wan_idx, TC_H_ROOT, 0);  /* silently ignores ENOENT */
-
-    int ret = tc__cake_qdisc_op(ctx, wan_idx, TC_H_ROOT, rate_Bps, opts_ul,
-                                NLM_F_CREATE | NLM_F_EXCL);
-
-    if (ret < 0 && errno == ENOENT && opts_ul && opts_ul->use_cake_mq) {
-        syslog(LOG_WARNING,
-               "tc_ul_setup: cake-mq not available on '%s', falling back to cake",
-               wan_if);
-        cake_qdisc_opts_t fallback = *opts_ul;
-        fallback.use_cake_mq = 0;
-        ret = tc__cake_qdisc_op(ctx, wan_idx, TC_H_ROOT, rate_Bps, &fallback,
-                                NLM_F_CREATE | NLM_F_EXCL);
+    if (r == -ENOENT && strstr(ctx->err, "nknown"))
+        snprintf(ctx->err, sizeof(ctx->err),
+                 "CAKE qdisc not available - install kmod-sched-cake");
+    if (r < 0) {
+        syslog(LOG_ERR, "%s: cannot attach CAKE: %s", ifname, ctx->err);
+        return r;
     }
-
-    if (ret < 0 && errno == EEXIST) {
-        /*
-         * Extremely unlikely race (another process created a qdisc between
-         * our delete and create).  Fall back to a change-in-place which will
-         * at least update the rate.
-         */
-        syslog(LOG_WARNING,
-               "tc_ul_setup: EEXIST race on '%s', applying change in-place",
-               wan_if);
-        ret = tc__cake_qdisc_op(ctx, wan_idx, TC_H_ROOT, rate_Bps, opts_ul, 0);
-    }
-
-    if (ret < 0) {
-        syslog(LOG_ERR, "tc_ul_setup: CAKE qdisc on '%s': %m", wan_if);
-        return -1;
-    }
-
-    /* Cache the UL opts so tc_cake_set_bandwidth fallback can use them */
-    if (opts_ul)
-        tc__cache_opts(ctx, wan_idx, opts_ul);
-
-    syslog(LOG_INFO, "tc_ul_setup: UL path ready (%s @ %u kbps)",
-           wan_if, rate_kbps);
+    *kind = "cake";
     return 0;
+}
+
+int tc_cake_set_bandwidth(tc_nl_ctx_t *ctx, const char *iface, const char *kind,
+                          uint32_t rate_kbps)
+{
+    unsigned int idx = if_nametoindex(iface);
+    if (!idx) {
+        set_err(ctx, ENODEV, iface);
+        return -ENODEV;
+    }
+
+    struct msg m;
+    tc_init(&m, RTM_NEWQDISC, 0, idx, TC_H_ROOT, 0);
+    put_str(&m, TCA_KIND, kind ? kind : "cake");
+    int opts = nest_start(&m, TCA_OPTIONS);
+    put_u64(&m, CAKE_BASE_RATE64, kbps_to_Bps(rate_kbps));
+    nest_end(&m, opts);
+    return nl_talk(ctx, &m, NULL, NULL);
+}
+
+static int ingress_add(tc_nl_ctx_t *ctx, unsigned int ifindex)
+{
+    struct msg m;
+    tc_init(&m, RTM_NEWQDISC, NLM_F_CREATE | NLM_F_EXCL, ifindex, TC_H_INGRESS, INGRESS_HANDLE);
+    put_str(&m, TCA_KIND, "ingress");
+    return nl_talk(ctx, &m, NULL, NULL);
+}
+
+static int redirect_add(tc_nl_ctx_t *ctx, unsigned int src_idx, unsigned int dst_idx)
+{
+    struct msg m;
+    struct tcmsg *t = tc_init(&m, RTM_NEWTFILTER, NLM_F_CREATE | NLM_F_EXCL,
+                              src_idx, INGRESS_HANDLE, 0);
+    t->tcm_info = TC_H_MAKE(1U << 16, (uint32_t)htons(ETH_P_ALL));
+
+    put_str(&m, TCA_KIND, "matchall");
+    int opts = nest_start(&m, TCA_OPTIONS);
+    put_u32(&m, TCA_MATCHALL_FLAGS, TCA_CLS_FLAGS_SKIP_HW);
+    int acts = nest_start(&m, TCA_MATCHALL_ACT);
+    int a1 = nest_start(&m, 1);
+    put_str(&m, TCA_ACT_KIND, "mirred");
+    int aopts = nest_start(&m, TCA_ACT_OPTIONS);
+    struct tc_mirred p;
+    memset(&p, 0, sizeof(p));
+    p.action = TC_ACT_STOLEN;
+    p.eaction = TCA_EGRESS_REDIR;
+    p.ifindex = dst_idx;
+    put_attr(&m, TCA_MIRRED_PARMS, &p, sizeof(p));
+    nest_end(&m, aopts);
+    nest_end(&m, a1);
+    nest_end(&m, acts);
+    nest_end(&m, opts);
+
+    return nl_talk(ctx, &m, NULL, NULL);
+}
+
+int tc_dl_setup(tc_nl_ctx_t *ctx, const char *wan_if, const char *dl_if,
+                int ifb_mode, uint32_t rate_kbps, const cake_opts_t *o,
+                int *created_ifb, const char **kind)
+{
+    unsigned int wan_idx = if_nametoindex(wan_if);
+    unsigned int dl_idx;
+    int r;
+
+    *created_ifb = 0;
+    if (!wan_idx) {
+        set_err(ctx, ENODEV, wan_if);
+        return -ENODEV;
+    }
+
+    if (!ifb_mode) {
+        dl_idx = if_nametoindex(dl_if);
+        if (!dl_idx) {
+            set_err(ctx, ENODEV, dl_if);
+            return -ENODEV;
+        }
+        r = cake_install(ctx, dl_idx, dl_if, rate_kbps, o, kind);
+        if (r == 0)
+            syslog(LOG_INFO, "download: %s on %s (egress) @ %u kbit/s", *kind, dl_if, rate_kbps);
+        return r;
+    }
+
+    if (!if_nametoindex(dl_if)) {
+        r = link_create_ifb(ctx, dl_if);
+        if (r < 0 && r != -EEXIST) {
+            if (r == -EOPNOTSUPP || r == -ENOENT)
+                snprintf(ctx->err, sizeof(ctx->err),
+                         "cannot create IFB device - install kmod-ifb");
+            syslog(LOG_ERR, "download: create %s: %s", dl_if, ctx->err);
+            return r;
+        }
+        *created_ifb = (r == 0);
+    }
+    dl_idx = if_nametoindex(dl_if);
+    if (!dl_idx || (r = link_set_up(ctx, dl_idx)) < 0) {
+        syslog(LOG_ERR, "download: bring up %s: %s", dl_if, ctx->err);
+        return dl_idx ? r : -ENODEV;
+    }
+
+    cake_opts_t dl = *o;
+    dl.ingress = 1;
+    dl.try_cake_mq = 0;
+    r = cake_install(ctx, dl_idx, dl_if, rate_kbps, &dl, kind);
+    if (r < 0)
+        return r;
+
+    qdisc_del(ctx, wan_idx, TC_H_INGRESS, INGRESS_HANDLE);
+    r = ingress_add(ctx, wan_idx);
+    if (r < 0 && r != -EEXIST) {
+        syslog(LOG_ERR, "download: ingress qdisc on %s: %s", wan_if, ctx->err);
+        return r;
+    }
+    r = redirect_add(ctx, wan_idx, dl_idx);
+    if (r < 0) {
+        syslog(LOG_ERR, "download: redirect %s -> %s: %s", wan_if, dl_if, ctx->err);
+        return r;
+    }
+
+    syslog(LOG_INFO, "download: %s ingress -> %s (%s) @ %u kbit/s", wan_if, dl_if, *kind, rate_kbps);
+    return 0;
+}
+
+void tc_dl_teardown(tc_nl_ctx_t *ctx, const char *wan_if, const char *dl_if,
+                    int ifb_mode, int delete_ifb)
+{
+    unsigned int idx;
+
+    if (ifb_mode && (idx = if_nametoindex(wan_if)))
+        qdisc_del(ctx, idx, TC_H_INGRESS, INGRESS_HANDLE);
+
+    if (ifb_mode && delete_ifb) {
+        link_delete(ctx, dl_if);
+    } else if ((idx = if_nametoindex(dl_if))) {
+        qdisc_del(ctx, idx, TC_H_ROOT, 0);
+    }
+}
+
+struct qcheck {
+    unsigned int ul_idx, dl_idx;
+    int ul_cake, dl_cake, ingress;
+};
+
+static void qdisc_dump_cb(const struct nlmsghdr *n, void *arg)
+{
+    struct qcheck *q = arg;
+    if (n->nlmsg_type != RTM_NEWQDISC)
+        return;
+    const struct tcmsg *t = NLMSG_DATA(n);
+    int len = (int)n->nlmsg_len - (int)NLMSG_LENGTH(sizeof(*t));
+    const char *kind = NULL;
+    for (const struct rtattr *a = (const struct rtattr *)((const char *)t + NLMSG_ALIGN(sizeof(*t)));
+         RTA_OK(a, len); a = RTA_NEXT(a, len))
+        if (a->rta_type == TCA_KIND)
+            kind = RTA_DATA(a);
+    if (!kind)
+        return;
+    unsigned int idx = (unsigned int)t->tcm_ifindex;
+    int cake = !strcmp(kind, "cake") || !strcmp(kind, "cake_mq");
+    if (t->tcm_parent == TC_H_ROOT && cake) {
+        if (idx == q->ul_idx) q->ul_cake = 1;
+        if (idx == q->dl_idx) q->dl_cake = 1;
+    }
+    if (t->tcm_parent == TC_H_INGRESS && idx == q->ul_idx && !strcmp(kind, "ingress"))
+        q->ingress = 1;
+}
+
+int tc_verify(tc_nl_ctx_t *ctx, const char *wan_if, const char *dl_if, int ifb_mode)
+{
+    struct qcheck q = { .ul_idx = if_nametoindex(wan_if), .dl_idx = if_nametoindex(dl_if) };
+    struct msg m;
+    struct tcmsg *t = msg_init(&m, RTM_GETQDISC, NLM_F_DUMP, sizeof(*t));
+    t->tcm_family = AF_UNSPEC;
+    if (!q.ul_idx || !q.dl_idx || nl_talk(ctx, &m, qdisc_dump_cb, &q) < 0)
+        return -1;
+    if (!q.ul_cake) { snprintf(ctx->err, sizeof(ctx->err), "CAKE on %s was removed", wan_if); return 0; }
+    if (!q.dl_cake) { snprintf(ctx->err, sizeof(ctx->err), "CAKE on %s was removed", dl_if); return 0; }
+    if (ifb_mode && !q.ingress) { snprintf(ctx->err, sizeof(ctx->err), "ingress redirect on %s was removed", wan_if); return 0; }
+    return 1;
+}
+
+int tc_ul_setup(tc_nl_ctx_t *ctx, const char *wan_if, uint32_t rate_kbps,
+                const cake_opts_t *o, const char **kind)
+{
+    unsigned int idx = if_nametoindex(wan_if);
+    if (!idx) {
+        set_err(ctx, ENODEV, wan_if);
+        return -ENODEV;
+    }
+    int r = cake_install(ctx, idx, wan_if, rate_kbps, o, kind);
+    if (r == 0)
+        syslog(LOG_INFO, "upload: %s on %s @ %u kbit/s", *kind, wan_if, rate_kbps);
+    return r;
 }
 
 void tc_ul_teardown(tc_nl_ctx_t *ctx, const char *wan_if)
 {
-    if (!ctx || !wan_if || !wan_if[0])
-        return;
+    unsigned int idx = if_nametoindex(wan_if);
+    if (idx)
+        qdisc_del(ctx, idx, TC_H_ROOT, 0);
+}
 
-    unsigned int wan_idx = if_nametoindex(wan_if);
-    if (wan_idx)
-        tc__qdisc_del(ctx, wan_idx, TC_H_ROOT, 0);
+int tc_link_monitor_open(void)
+{
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (fd < 0)
+        return -1;
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK, .nl_groups = RTMGRP_LINK };
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
 
-    syslog(LOG_INFO, "tc_ul_teardown: UL path removed (%s)", wan_if);
+int tc_link_monitor_drain(int fd)
+{
+    char buf[4096];
+    int any = 0;
+    for (;;) {
+        ssize_t r = recv(fd, buf, sizeof(buf), 0);
+        if (r > 0) { any = 1; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && errno == ENOBUFS) { any = 1; continue; }
+        break;
+    }
+    return any;
 }

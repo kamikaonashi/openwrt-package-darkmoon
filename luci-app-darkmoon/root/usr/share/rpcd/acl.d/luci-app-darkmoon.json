@@ -1,0 +1,23 @@
+{
+	"luci-app-darkmoon": {
+		"description": "Grant access to darkmoon status and configuration",
+		"read": {
+			"ubus": {
+				"darkmoon.*": [ "status" ],
+				"service": [ "list" ],
+				"luci": [ "getInitList" ]
+			},
+			"file": {
+				"/sys/module/sch_cake": [ "list" ],
+				"/sys/module/ifb": [ "list" ]
+			},
+			"uci": [ "darkmoon", "firewall", "sqm", "network" ]
+		},
+		"write": {
+			"ubus": {
+				"luci": [ "setInitAction" ]
+			},
+			"uci": [ "darkmoon" ]
+		}
+	}
+}

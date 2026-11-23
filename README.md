@@ -1,173 +1,165 @@
 # darkmoon
 
-A lightweight, CPU-efficient C rewrite of [cake-autorate](https://github.com/lynxthecat/cake-autorate) for OpenWrt. Designed for routers where maximizing CPU efficiency is a priority.
+A lightweight, CPU-efficient C implementation of [cake-autorate](https://github.com/lynxthecat/cake-autorate) for OpenWrt 24.10 and 25.12.
 
-## Background
+darkmoon continuously measures latency to a set of reflectors and adjusts the CAKE shaper bandwidth so queues never build up. It is meant for links whose capacity varies: LTE/5G, Starlink, busy cable segments, Wi-Fi backhauls, and DSL with fluctuating sync.
 
-The original [cake-autorate](https://github.com/lynxthecat/cake-autorate) created by [@lynxthecat](https://github.com/lynxthecat) is a highly effective bash script that dynamically adjusts CAKE bandwidth based on real-time One-Way Delay (OWD) measurements.
-
-While the algorithm is excellent at mitigating bufferbloat, running a complex bash script that continuously spawns new processes and subshells can consume a significant amount of CPU on lower-end routers.
-
-**darkmoon** resolves this by reimplementing the exact same algorithm as a native C binary and OpenWrt procd service. It drastically reduces CPU overhead while maintaining identical adaptive traffic-shaping behavior.
-
-*All credit for the original algorithm, math, and concept goes to [@lynxthecat](https://github.com/lynxthecat) and the contributors of the original repository.*
+*All credit for the algorithm goes to [@lynxthecat](https://github.com/lynxthecat) and the cake-autorate contributors.*
 
 ---
 
 ## Features
 
-- **Native C implementation** — no bash scripts, no subshells, minimal CPU footprint
-- **Event-driven architecture** — uses `libubox/uloop` to eliminate polling busy-loops
-- **Direct CAKE management** — creates and manages IFB + CAKE qdiscs entirely via raw NETLINK_ROUTE, with no dependency on SQM scripts
-- **Efficient system I/O** — reads network statistics directly from `/sys/class/net/.../statistics`
-- **Asynchronous pinging** — custom ICMP pinger supporting both Echo (type 8) and Timestamp (type 13) modes
-- **Per-direction flow isolation** — separate CAKE `flow_mode` settings for DL ingress and UL egress
-- **Dynamic reflector health** — automatically monitors and replaces unresponsive ping targets
-- **Flash storage safe** — all state data kept in RAM, zero flash writes at runtime
-- **LuCI web interface** — fully integrated UI for configuration, service control, and live status
-
----
-
-## How It Works
-
-The daemon continuously measures latency using ICMP and maintains an asymmetric EWMA baseline per reflector to detect genuine bufferbloat versus normal variance. It classifies network load into four states and adjusts the CAKE shaper rate accordingly:
-
-| State | Condition | Action |
-| :--- | :--- | :--- |
-| **BUFFERBLOAT** | OWD delta exceeds configured threshold | Reduces shaper rate aggressively |
-| **HIGH** | Achieved rate > `high_load_thr × shaper_rate` | Increases shaper rate |
-| **LOW** | Achieved rate > `connection_active_thr` | Decays shaper rate toward base rate |
-| **IDLE** | Minimal traffic detected | Decays shaper rate toward base rate |
-
-By default the daemon uses `ping_type 0` (ICMP Echo, RTT/2 as OWD proxy). For more accurate per-direction OWD on asymmetric links such as 5G/LTE, `ping_type 1` (ICMP Timestamp) is recommended where reflectors support it.
+- **Faithful cake-autorate algorithm**: per-reflector OWD baselines with asymmetric EWMA, bufferbloat detection window, load classification, interpolated rate increases and decreases, shaper-delay compensated thresholds, and decay toward a base rate.
+- **Full reflector management**: replacement of unresponsive reflectors, periodic comparison (baseline and jitter outliers are rotated out), periodic random rotation, a spare queue, and retained statistics.
+- **Idle sleep and stall handling**: pings pause after sustained idle and resume instantly on traffic. Includes connection-stall detection, a global ping timeout with pinger restart, and optional minimum-rate enforcement.
+- **Two measurement modes**: ICMP echo (RTT/2, works everywhere) or ICMP timestamp (true one-way delay per direction; clock offsets and clock steps are handled).
+- **Standalone shaping**: creates the IFB, CAKE qdiscs, ingress qdisc and matchall/mirred redirect itself via netlink. No sqm-scripts, no `tc`/`ip` binaries, no shell.
+- **Self-healing**: waits for the WAN device at boot (PPPoE, LTE), reacts immediately to link changes, and rebuilds shaping if the device is recreated or the qdiscs are removed.
+- **Efficient**: one single-threaded process on libubox `uloop`, kernel-side BPF filtering of ICMP replies, and no floating point. About 0.2 % of one Cortex-A53 core and under 1 MB RSS on a Filogic router.
+- **Status over ubus**: `ubus call darkmoon.<instance> status`. Nothing is written to flash or tmpfs.
+- **Optional LuCI app**: live dashboard with charts, a full settings page and an Overview widget.
+- **Multiple instances** for multi-WAN setups.
 
 ---
 
 ## Installation
 
-### Prerequisites
+Download the packages for your architecture from the Releases page:
+
+| OpenWrt | Daemon | Web interface (optional) |
+| :-- | :-- | :-- |
+| 25.12 | `darkmoon-<ver>.apk` | `luci-app-darkmoon-<ver>.apk` |
+| 24.10 | `darkmoon_<ver>_<arch>.ipk` | `luci-app-darkmoon_<ver>_all.ipk` |
 
 ```sh
-apk update
-apk add libubox libuci
+# OpenWrt 25.12
+apk add --allow-untrusted darkmoon-*.apk luci-app-darkmoon-*.apk
+# OpenWrt 24.10
+opkg install darkmoon_*.ipk luci-app-darkmoon_*.ipk
 ```
 
-### From a Release
+Dependencies (`kmod-sched-cake`, `kmod-ifb`, `libubox`, `libubus`, `libuci`) are pulled in automatically when the package feeds are reachable.
 
-Download the appropriate `.apk` for your architecture from the Releases page, upload it to your router, and install:
+### Building
 
-```sh
-apk add --allow-untrusted darkmoon_*.apk
-```
-
-Enable and start the service:
+With an OpenWrt SDK:
 
 ```sh
-/etc/init.d/darkmoon enable
-/etc/init.d/darkmoon start
-```
-
-### From Source (OpenWrt SDK)
-
-```sh
-make package/darkmoon/compile V=s
+echo "src-link darkmoon /path/to/this/repo" >> feeds.conf.default
+./scripts/feeds update -a && ./scripts/feeds install darkmoon
+make package/darkmoon/compile V=s     # builds darkmoon and luci-app-darkmoon
 ```
 
 ---
 
-## Configuration
+## Quick start
 
-The recommended way to configure darkmoon is through the LuCI web interface at **Services → Darkmoon**. Clicking Save & Apply will automatically reload the daemon.
+1. **Disable hardware flow offloading** (Network → Firewall → *Hardware flow offloading*). Hardware-offloaded connections bypass the CPU and therefore CAKE. Software offloading is fine.
+2. Make sure no SQM queue shapes the same interface.
+3. Open **Services → Darkmoon → Settings** (or edit `/etc/config/darkmoon`):
+   - **WAN device**: e.g. `wan`, `eth1`, `pppoe-wan`, `wwan0`
+   - **Minimum / base / maximum** rates per direction, in kbit/s:
+     - *maximum*: the most your line can ever do (usually your plan speed)
+     - *base*: a rate the line reliably achieves; darkmoon settles here when idle
+     - *minimum*: the lowest acceptable rate under heavy bufferbloat
+4. Tick **Enable** and press **Save & Apply**.
 
-Alternatively, edit the config file directly over SSH:
+Via SSH:
 
 ```sh
-vi /etc/config/darkmoon
+uci set darkmoon.primary.ul_if='wan'
+uci set darkmoon.primary.min_dl_shaper_rate_kbps='20000'
+uci set darkmoon.primary.base_dl_shaper_rate_kbps='80000'
+uci set darkmoon.primary.max_dl_shaper_rate_kbps='120000'
+uci set darkmoon.primary.min_ul_shaper_rate_kbps='5000'
+uci set darkmoon.primary.base_ul_shaper_rate_kbps='20000'
+uci set darkmoon.primary.max_ul_shaper_rate_kbps='40000'
+uci set darkmoon.primary.enabled='1'
+uci commit darkmoon && /etc/init.d/darkmoon restart
 ```
 
-The minimum required options are the interface names and rate limits. Ensure `dl_if` and `ul_if` match your router's actual interfaces — for typical setups, download traffic arrives on an IFB interface and upload on the physical WAN interface.
-
-```
-config darkmoon 'primary'
-    option enabled                  '1'
-    option dl_if                    'ifb4wan'
-    option ul_if                    'wan'
-    option base_dl_shaper_rate_kbps '50000'
-    option base_ul_shaper_rate_kbps '20000'
-    option max_dl_shaper_rate_kbps  '100000'
-    option max_ul_shaper_rate_kbps  '35000'
-```
-
-### CAKE Options
-
-CAKE qdisc options such as `overhead`, `mpu`, `rtt`, `memlimit`, and `wash` are configured separately for DL and UL. Flow isolation mode can also be set independently per direction — for example `dual-dsthost` on ingress and `dual-srchost` on egress, which is the recommended setup for most home routers.
-
-### 5G / LTE Notes
-
-On cellular links the UL scheduling latency is inherently higher and more variable than DL, even at idle, due to the base station grant request cycle. If your idle UL OWD delta appears elevated (5–10ms) with no load, this is normal radio behaviour and not a misconfiguration. Consider:
-
-- Setting `ping_type 1` (ICMP Timestamp) for true per-direction OWD rather than RTT/2
-- Slightly raising `alpha_baseline_increase` (e.g. `0.005`) to let the baseline track the natural idle jitter floor of your link
+Configuration changes are picked up automatically: procd restarts the instance when `/etc/config/darkmoon` changes.
 
 ---
 
-## Live Status
+## How it works
 
-The LuCI Overview page displays a live status widget that polls every 2.5 seconds. When the daemon is running it shows:
+Each reflector is pinged every `reflector_ping_interval_s` (default 0.3 s). With 6 reflectors that gives a sample roughly every 50 ms. For every reply darkmoon:
 
-| Field | Description |
-| :--- | :--- |
-| Status | Current autorate state (Running / Idle / Stall) |
-| DL / UL Shaped | Current CAKE shaper rate |
-| DL / UL Actual | Measured achieved throughput |
-| DL / UL Load | Load classification (High / Low / Idle / Bufferbloat) |
-| OWD DL / UL Δ | One-way delay delta above baseline — turns red above +10ms |
-| Uptime | Time since daemon started |
+1. updates that reflector's **baseline** OWD (it follows decreases quickly and increases very slowly),
+2. records the **delta** above baseline in a sliding window, counting a sample as *delayed* when the delta exceeds the delay threshold plus the serialisation time of one full packet at the current rate,
+3. declares **bufferbloat** when at least `bufferbloat_detection_thr` of the last `bufferbloat_detection_window` samples are delayed, and
+4. adjusts each direction:
 
-The daemon writes `/var/run/darkmoon.json` every ~200ms. The file is removed on clean shutdown so the widget immediately reflects stopped state.
+| Condition | Action |
+| :-- | :-- |
+| Bufferbloat | Decrease by 1–25 %, harder the larger the average delta (with a refractory period) |
+| High load (achieved > 75 % of shaper) | Increase by 0–4 %, slower as the delta approaches the threshold |
+| Low load / idle | Decay 1 % per second toward the base rate |
+
+Reflectors that stop answering, have a clearly worse baseline, or are noticeably more jittery than the best reflector are swapped for a spare. After `sustained_idle_sleep_thr_s` of idle the pingers sleep until traffic returns.
+
+### Download shaping
+
+By default darkmoon creates an IFB device (`dl_if`, default `ifb-wan`) and redirects all ingress traffic of the WAN device to it, where a CAKE qdisc in `ingress` mode shapes it. If `dl_if` names an existing non-IFB device such as `br-lan`, darkmoon instead puts CAKE on that device's egress. Traffic terminating on the router itself is then not shaped.
+
+### Echo vs timestamp pings
+
+- **echo** (default) works with any host, but only measures round-trip time. A delay in either direction counts against both.
+- **timestamp** gives true per-direction delay. It needs reflectors that answer ICMP timestamp requests; most public DNS servers don't, and some carrier-grade NAT gateways drop these packets entirely. See [tievolu/timestamp-reflectors](https://github.com/tievolu/timestamp-reflectors). Those CSV lists can be used directly with `option reflectors_file`; a random subset of 128 addresses is taken from large files.
 
 ---
 
-## Verification and Logging
-
-Confirm the service is running under procd:
+## Status and troubleshooting
 
 ```sh
-ubus call service list '{"name":"darkmoon"}'
+/etc/init.d/darkmoon status            # all instances
+ubus call darkmoon.primary status      # one instance, JSON
+logread -e darkmoon                    # log (set option debug '1' for every decision)
+tc -s qdisc show dev ifb-wan           # download CAKE
+tc -s qdisc show dev wan               # upload CAKE
 ```
 
-Watch the daemon adjust bandwidth in real time:
+The `state` field is one of:
 
-```sh
-logread -f -e darkmoon
-```
+- `running`
+- `idle`: pingers asleep
+- `stall`: no reflector replies and no traffic
+- `waiting`: the WAN device is missing or qdisc setup failed; the `error` field says why
 
-Inspect the live status JSON directly:
+---
 
-```sh
-cat /var/run/darkmoon.json
-```
+## Configuration reference
+
+All options with their defaults are documented in [`root/etc/config/darkmoon`](root/etc/config/darkmoon). Names and defaults follow upstream cake-autorate where an equivalent exists. darkmoon-specific options:
+
+| Option | Default | Description |
+| :-- | :-- | :-- |
+| `link_layer` | `ethernet` | Overhead preset (`raw`, `ethernet`, `docsis`, `pppoe-ptm`, `bridged-ptm`, ATM variants, or `custom` with `cake_overhead`/`cake_mpu`/`cake_atm`) |
+| `cake_diffserv` | `diffserv4` | CAKE tin structure |
+| `cake_dl_flow_mode` / `cake_ul_flow_mode` | `dual-dsthost` / `dual-srchost` | Per-direction fairness |
+| `cake_nat`, `cake_wash`, `cake_ack_filter`, `cake_split_gso` | `1`, `1`, `0`, `1` | CAKE flags (wash and ACK filter apply to upload only) |
+| `cake_rtt_ms`, `cake_memlimit_kb` | `0` | 0 = CAKE defaults |
+| `cake_mq` | `0` | Use `cake_mq` on upload when the kernel supports it (Linux 6.19+); falls back to `cake` |
+| `ping_type` | `echo` | `echo` or `timestamp` |
+| `reflectors_file` | empty | Plain list or CSV (first column), replaces `reflectors` |
+| `bind_ping_to_ul_if` | `0` | Bind pings to the WAN device (multi-WAN) |
+| `retain_reflector_stats` | `1` | Remember baselines of rotated-out reflectors |
+| `debug` | `0` | Log every decision |
+
+Configs from darkmoon 1.x (numeric `cake_*` values, `cake_flow_mode`, `cake_overhead`) are still accepted.
 
 ---
 
 ## Credits
 
-Original algorithm & concept: [@lynxthecat](https://github.com/lynxthecat) — [cake-autorate](https://github.com/lynxthecat/cake-autorate)
+Original algorithm and concept: [@lynxthecat](https://github.com/lynxthecat), [cake-autorate](https://github.com/lynxthecat/cake-autorate)
 
-C rewrite & OpenWrt integration: kamikaonashi
+C implementation and OpenWrt integration: kamikaonashi
 
 ## License
 
 This project is released under the MIT License.
 
 The original cake-autorate project is licensed under its own terms. Please see the upstream repository for details.
-
----
-
-## Screenshots
-
-<img width="3343" height="1318" alt="Screenshot From 2026-02-26 17-26-41" src="https://github.com/user-attachments/assets/2dde3238-859f-4f90-86a1-b57384f253cf" />
-<img width="3343" height="1318" alt="Screenshot From 2026-02-26 17-26-46" src="https://github.com/user-attachments/assets/d9149822-3a21-4f3c-ab15-c09b0a83507b" />
-<img width="3343" height="1318" alt="Screenshot From 2026-02-26 17-26-54" src="https://github.com/user-attachments/assets/132e7d98-eaa3-4a2b-aaf8-70e37d1d5bab" />
-<img width="3343" height="1318" alt="Screenshot From 2026-02-26 17-26-59" src="https://github.com/user-attachments/assets/626c132d-e15a-48b2-850f-38aadf523412" />
-<img width="3343" height="1318" alt="Screenshot From 2026-02-26 17-27-04" src="https://github.com/user-attachments/assets/59adcf63-c6e1-4805-975c-619120fd4bf1" />

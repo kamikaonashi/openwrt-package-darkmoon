@@ -1,1499 +1,1040 @@
 /*
- * cake-autorate – C rewrite for OpenWrt
- *
- * Standalone CAKE autorate daemon: no SQM scripts required.
- *
- * Lifecycle managed entirely in-process via tc_netlink.c:
- *   Startup  → tc_dl_setup() + tc_ul_setup()   (creates IFB, qdiscs, filters)
- *   Runtime  → tc_cake_set_bandwidth()          (adjusts rates in-place)
- *   Shutdown → tc_dl_teardown() + tc_ul_teardown() (removes all TC objects)
- *
- * Algorithm mirrors cake-autorate.sh:
- *   • ICMP ping via raw IPv4 socket (in-process, no external pinger binary)
- *     – ping_type 0: ICMP Echo (type 8/0) – RTT/2, symmetric assumption
- *     – ping_type 1: ICMP Timestamp (type 13/14) – true per-direction OWD
- *   • Rate monitor via /sys/class/net polling
- *   • OWD EWMA baseline + delta sliding window for bufferbloat detection
- *   • Reflector health monitoring with automatic replacement
+ * darkmoon - cake-autorate in C for OpenWrt.
+ * Algorithm by @lynxthecat: https://github.com/lynxthecat/cake-autorate
  */
-
+#include <arpa/inet.h>
+#include <errno.h>
+#include <getopt.h>
+#include <net/if.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <syslog.h>
 #include <time.h>
-#include <sys/wait.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <net/if.h>
-#include <netinet/ip.h>
-#include <netinet/ip_icmp.h>
+#include <unistd.h>
 
-#include <libubox/uloop.h>
+#include "autorate.h"
+#include "icmp.h"
 
-#include "config.h"
-#include "rate_monitor.h"
-#include "tc_netlink.h"
+#define FP 1000000LL
 
-/* ────────────────────────────────────────────────────────────── */
-/*  Constants                                                     */
-/* ────────────────────────────────────────────────────────────── */
-#define DIR_DL 0
-#define DIR_UL 1
+#define DBG(ar, ...) do { if ((ar)->cfg.debug) syslog(LOG_DEBUG, __VA_ARGS__); } while (0)
 
-#define LOAD_IDLE 0
-#define LOAD_LOW  1
-#define LOAD_HIGH 2
-#define LOAD_BB   3  /* bufferbloat */
+static autorate_t AR;
 
-#define STATE_RUNNING 0
-#define STATE_IDLE    1
-#define STATE_STALL   2
-
-/* Hard cap on the misbehaving-detection window (offences[] array size). */
-#define MAX_OFFENCE_WINDOW 64
-
-/* ────────────────────────────────────────────────────────────── */
-/*  ICMP type 13/14 (Timestamp) definitions                       */
-/* ────────────────────────────────────────────────────────────── */
-
-/* Guard: some older OpenWrt SDK header snapshots omit these. */
-#ifndef ICMP_TIMESTAMP
-#define ICMP_TIMESTAMP      13
-#define ICMP_TIMESTAMPREPLY 14
-#endif
-
-/*
- * ICMP Timestamp wire format (RFC 792).
- * All timestamp fields are milliseconds since midnight UT, big-endian.
- * Follows the standard icmphdr (8 bytes).
- */
-struct icmp_ts_body {
-    uint32_t originate;  /* sender's transmit time (echoed back by reflector) */
-    uint32_t receive;    /* reflector receive time  (0 in request)             */
-    uint32_t transmit;   /* reflector transmit time (0 in request)             */
-};
-
-/* Milliseconds per day – timestamp wraps at this value */
-#define MS_PER_DAY 86400000UL
-
-/*
- * PING_SEQ_RING – sequence number ring for correlating type-13 replies.
- *
- * For ICMP echo we embed a monotonic timestamp directly in the payload.
- * For ICMP timestamp the 32-bit originate field holds ms-since-midnight,
- * which is too coarse and doesn't encode reflector index.  Instead we
- * store per-sequence metadata here, keyed by (seq % PING_SEQ_RING).
- *
- * With pings every ~50 ms and max RTT < 2 s we have ≤40 in-flight pings;
- * 256 slots provides a comfortable safety margin before wrap collision.
- */
-#define PING_SEQ_RING 256
-
-typedef struct {
-    int64_t  t_sent_us;      /* monotonic µs at send time (for RTT if needed) */
-    uint32_t originate_ms;   /* ms-since-midnight sent in originate field      */
-    int      reflector_idx;  /* which active reflector this ping was sent to   */
-} ping_seq_slot_t;
-
-/* ────────────────────────────────────────────────────────────── */
-/*  Per-reflector runtime state                                   */
-/* ────────────────────────────────────────────────────────────── */
-typedef struct {
-    char    addr[64];
-    uint32_t addr_be;
-    int64_t dl_owd_baseline_us;
-    int64_t ul_owd_baseline_us;
-    int64_t dl_owd_delta_ewma_us;
-    int64_t ul_owd_delta_ewma_us;
-    int64_t last_response_us;        /* 0 = no response yet */
-    int     offences[MAX_OFFENCE_WINDOW];
-    int     offences_idx;
-    int     sum_offences;
-} reflector_t;
-
-/* ────────────────────────────────────────────────────────────── */
-/*  Global application state                                      */
-/* ────────────────────────────────────────────────────────────── */
-typedef struct {
-    cake_config_t   cfg;
-    rate_monitor_t  rm;
-    tc_nl_ctx_t    *tc_nl;
-
-    /* Shaper rates (kbps) */
-    uint32_t shaper_rate_kbps[2];
-    uint32_t last_shaper_rate_kbps[2];
-
-    /* Achieved rates */
-    uint32_t achieved_rate_kbps[2];
-    int      achieved_rate_updated[2];
-
-    /* Load classification */
-    int      load_condition[2];
-    int      bufferbloat_detected[2];
-    int64_t  t_last_bufferbloat_us[2];
-    int64_t  t_last_decay_us[2];
-
-    /* OWD sliding window (allocated to cfg.bufferbloat_detection_window) */
-    int     *dl_delays;
-    int     *ul_delays;
-    int64_t *dl_owd_deltas_us;
-    int64_t *ul_owd_deltas_us;
-    int      delays_idx;
-    int      delays_fill;
-    int64_t  sum_dl_delays;
-    int64_t  sum_ul_delays;
-    int64_t  sum_dl_owd_deltas_us;
-    int64_t  sum_ul_owd_deltas_us;
-    int64_t  avg_owd_delta_us[2];
-
-    /* Reflectors */
-    reflector_t reflectors[MAX_REFLECTORS];
-    int         no_active_reflectors;  /* = min(cfg.no_pingers, cfg.no_reflectors) */
-    int         spare_idx;             /* next unused spare in cfg.reflectors[] */
-    int64_t     t_last_reflector_health_us;
-    int64_t     global_last_response_us;
-
-    /* Integrated ICMP pinger (IPv4 raw socket) */
-    int               icmp_sock;
-    struct uloop_fd   icmp_ufd;
-    struct uloop_timeout ping_timer;
-    uint16_t          ping_id;
-    uint16_t          ping_seq;
-    int               ping_rr_idx;  /* round-robin reflector index */
-
-    /* Per-sequence state for ICMP timestamp mode (type 13) */
-    ping_seq_slot_t   ping_seq_ring[PING_SEQ_RING];
-
-    /* Timers */
-    struct uloop_timeout rate_timer;
-    struct uloop_timeout health_timer;
-
-    /* State machine */
-    int main_state;
-
-    /* Ping response interval (µs): ping_interval / no_pingers */
-    int64_t ping_response_interval_us;
-
-    /* Track whether setup succeeded (for teardown) */
-    int dl_setup_done;
-    int ul_setup_done;
-
-    /* Feature: interface up/down recovery (if_up_check_interval_us) */
-    struct uloop_timeout if_up_timer;
-    int                  link_up;        /* 1 = WAN interface is currently up */
-
-    /* Status file – written every rate-monitor tick for LuCI display */
-    int64_t t_started_us;       /* monotonic start time for uptime   */
-} autorate_t;
-
-/* ────────────────────────────────────────────────────────────── */
-/*  Helpers                                                       */
-/* ────────────────────────────────────────────────────────────── */
-static int64_t now_us(void)
+int64_t now_us(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+    return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
 }
 
-static void set_nonblocking(int fd)
-{
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0)
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-/* ────────────────────────────────────────────────────────────── */
-/*  Runtime status file  (/var/run/darkmoon.json)                  */
-/*                                                                */
-/*  Written on every rate-monitor tick (~200 ms).                 */
-/*  Read by the LuCI Overview widget via file.read RPC.           */
-/*  Uses atomic rename(tmp→final) to avoid partial reads.         */
-/* ────────────────────────────────────────────────────────────── */
-
-static const char *load_str(int cond)
-{
-    switch (cond) {
-        case LOAD_LOW:  return "low";
-        case LOAD_HIGH: return "high";
-        case LOAD_BB:   return "bufferbloat";
-        default:        return "idle";
-    }
-}
-
-static const char *state_str(int s)
+const char *state_name(int s)
 {
     switch (s) {
-        case STATE_IDLE:  return "idle";
-        case STATE_STALL: return "stall";
-        default:          return "running";
+    case STATE_RUNNING: return "running";
+    case STATE_IDLE:    return "idle";
+    case STATE_STALL:   return "stall";
+    default:            return "waiting";
     }
 }
 
-static void write_status_file(autorate_t *ar)
+const char *load_name(int l)
 {
-    static const char *path     = "/var/run/darkmoon.json";
-    static const char *path_tmp = "/var/run/darkmoon.json.tmp";
+    switch (l) {
+    case LOAD_HIGH: return "high";
+    case LOAD_LOW:  return "low";
+    default:        return "idle";
+    }
+}
 
-    FILE *f = fopen(path_tmp, "w");
-    if (!f)
+static const char *dir_name(int d) { return d == DL ? "download" : "upload"; }
+
+static const char *ip_str(uint32_t be)
+{
+    static char buf[4][INET_ADDRSTRLEN];
+    static int i;
+    struct in_addr a = { .s_addr = be };
+    i = (i + 1) & 3;
+    return inet_ntop(AF_INET, &a, buf[i], sizeof(buf[i]));
+}
+
+static int64_t clamp64(int64_t v, int64_t lo, int64_t hi)
+{
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+static void set_error(autorate_t *ar, const char *fmt, ...)
+{
+    char buf[sizeof(ar->last_error)];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (strcmp(buf, ar->last_error) != 0) {
+        snprintf(ar->last_error, sizeof(ar->last_error), "%s", buf);
+        if (buf[0])
+            syslog(LOG_WARNING, "%s", buf);
+    }
+}
+
+static void set_state(autorate_t *ar, int s)
+{
+    if (ar->state == s)
         return;
-
-    int64_t uptime_s   = (now_us() - ar->t_started_us) / 1000000LL;
-    long dl_owd_ms10   = (long)((ar->avg_owd_delta_us[DIR_DL] + 50LL) / 100LL);
-    long ul_owd_ms10   = (long)((ar->avg_owd_delta_us[DIR_UL] + 50LL) / 100LL);
-
-    fprintf(f,
-        "{\n"
-        "  \"instance\": \"%s\",\n"
-        "  \"state\": \"%s\",\n"
-        "  \"link_up\": %d,\n"
-        "  \"dl_if\": \"%s\",\n"
-        "  \"ul_if\": \"%s\",\n"
-        "  \"shaper_dl_kbps\": %u,\n"
-        "  \"shaper_ul_kbps\": %u,\n"
-        "  \"achieved_dl_kbps\": %u,\n"
-        "  \"achieved_ul_kbps\": %u,\n"
-        "  \"load_dl\": \"%s\",\n"
-        "  \"load_ul\": \"%s\",\n"
-        "  \"bb_dl\": %d,\n"
-        "  \"bb_ul\": %d,\n"
-        "  \"avg_owd_dl_ms10\": %ld,\n"
-        "  \"avg_owd_ul_ms10\": %ld,\n"
-        "  \"active_reflectors\": %d,\n"
-        "  \"uptime_s\": %lld\n"
-        "}\n",
-        ar->cfg.instance_id,
-        state_str(ar->main_state),
-        ar->link_up,
-        ar->cfg.dl_if,
-        ar->cfg.ul_if,
-        ar->shaper_rate_kbps[DIR_DL],
-        ar->shaper_rate_kbps[DIR_UL],
-        ar->achieved_rate_kbps[DIR_DL],
-        ar->achieved_rate_kbps[DIR_UL],
-        load_str(ar->load_condition[DIR_DL]),
-        load_str(ar->load_condition[DIR_UL]),
-        ar->bufferbloat_detected[DIR_DL],
-        ar->bufferbloat_detected[DIR_UL],
-        dl_owd_ms10,
-        ul_owd_ms10,
-        ar->no_active_reflectors,
-        (long long)uptime_s
-    );
-
-    fclose(f);
-    rename(path_tmp, path);
+    DBG(ar, "state %s -> %s", state_name(ar->state), state_name(s));
+    ar->state = s;
+    ar->t_state_us = now_us();
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/*  Build cake_qdisc_opts_t from config                           */
-/* ────────────────────────────────────────────────────────────── */
-
-/*
- * make_dl_opts – options for the IFB (download) CAKE qdisc.
- *
- *  .ingress = 1  tells CAKE it is on an ingress (IFB) path.
- *  .wash    = 0  we preserve DSCP on DL so the local stack still
- *               sees original markings; washing only makes sense UL.
- */
-static cake_qdisc_opts_t make_dl_opts(const cake_config_t *c)
+static int64_t ping_response_interval_us(const autorate_t *ar)
 {
-    cake_qdisc_opts_t o;
-    memset(&o, 0, sizeof(o));
-    o.overhead   = c->cake_overhead;
-    o.mpu        = c->cake_mpu;
-    o.nat        = c->cake_nat;
-    o.wash       = 0;                 /* never wash on DL/IFB */
-    o.ingress    = 1;                 /* always set for IFB   */
-    o.ack_filter = 0;                 /* ACK filtering is UL-only */
-    o.diffserv   = (uint32_t)c->cake_diffserv;
-    o.flow_mode  = (uint32_t)c->cake_dl_flow_mode;
-    o.atm        = (uint32_t)c->cake_atm;
-    o.rtt_us     = c->cake_rtt_us;
-    o.split_gso  = (uint32_t)c->cake_split_gso;
-    o.use_cake_mq = (uint32_t)c->cake_mq;
-    return o;
+    return ar->cfg.reflector_ping_interval_us / ar->no_pingers;
 }
 
-/*
- * make_ul_opts – options for the WAN (upload) CAKE qdisc.
- *
- *  .ingress = 0  normal egress qdisc.
- *  .wash    = per-config (strip DSCP on UL by default).
- */
-static cake_qdisc_opts_t make_ul_opts(const cake_config_t *c)
+/* add the serialisation delay of one full packet to the thresholds */
+static void update_compensation(autorate_t *ar)
 {
-    cake_qdisc_opts_t o;
-    memset(&o, 0, sizeof(o));
-    o.overhead   = c->cake_overhead;
-    o.mpu        = c->cake_mpu;
-    o.nat        = c->cake_nat;
-    o.wash       = (uint32_t)c->cake_wash;
-    o.ingress    = 0;
-    o.ack_filter = (uint32_t)c->cake_ack_filter;
-    o.diffserv   = (uint32_t)c->cake_diffserv;
-    o.flow_mode  = (uint32_t)c->cake_ul_flow_mode;
-    o.atm        = (uint32_t)c->cake_atm;
-    o.rtt_us     = c->cake_rtt_us;
-    o.split_gso  = (uint32_t)c->cake_split_gso;
-    o.use_cake_mq = (uint32_t)c->cake_mq;
-    return o;
-}
-
-/* ────────────────────────────────────────────────────────────── */
-/*  CAKE setup / teardown                                         */
-/* ────────────────────────────────────────────────────────────── */
-
-/*
- * cake_setup – create the full DL + UL CAKE plumbing.
- *
- * DL: IFB created, brought up, CAKE attached, ingress qdisc on WAN,
- *     match-all mirred redirect filter WAN→IFB.
- * UL: CAKE root qdisc attached to WAN.
- *
- * Sets ar->dl_setup_done / ul_setup_done so teardown knows what to undo.
- */
-static int cake_setup(autorate_t *ar)
-{
-    cake_config_t *c = &ar->cfg;
-
-    if (c->adjust_dl_shaper_rate && c->dl_if[0]) {
-        cake_qdisc_opts_t dl_opts = make_dl_opts(c);
-        if (tc_dl_setup(ar->tc_nl,
-                        c->ul_if,          /* WAN interface */
-                        c->dl_if,          /* IFB interface */
-                        ar->shaper_rate_kbps[DIR_DL],
-                        &dl_opts) < 0) {
-            syslog(LOG_ERR, "cake_setup: DL path failed: %m");
-            return -1;
-        }
-        ar->dl_setup_done = 1;
-        ar->last_shaper_rate_kbps[DIR_DL] = ar->shaper_rate_kbps[DIR_DL];
-    }
-
-    if (c->adjust_ul_shaper_rate && c->ul_if[0]) {
-        cake_qdisc_opts_t ul_opts = make_ul_opts(c);
-        if (tc_ul_setup(ar->tc_nl,
-                        c->ul_if,
-                        ar->shaper_rate_kbps[DIR_UL],
-                        &ul_opts) < 0) {
-            syslog(LOG_WARNING,
-                   "cake_setup: UL path deferred (will retry): %m");
-        } else {
-            ar->ul_setup_done = 1;
-            ar->last_shaper_rate_kbps[DIR_UL] = ar->shaper_rate_kbps[DIR_UL];
-        }
-    }
-
-    return 0;
-}
-
-/*
- * cake_teardown – remove all CAKE TC objects created by cake_setup().
- *
- * Called on graceful shutdown.  Leaves interfaces in a clean state
- * without any rate limiting.
- */
-static void cake_teardown(autorate_t *ar)
-{
-    cake_config_t *c = &ar->cfg;
-
-    if (ar->dl_setup_done) {
-        tc_dl_teardown(ar->tc_nl, c->ul_if, c->dl_if);
-        ar->dl_setup_done = 0;
-    }
-
-    if (ar->ul_setup_done) {
-        tc_ul_teardown(ar->tc_nl, c->ul_if);
-        ar->ul_setup_done = 0;
-    }
-}
-
-/* ────────────────────────────────────────────────────────────── */
-/*  CAKE rate control                                             */
-/* ────────────────────────────────────────────────────────────── */
-static void clamp_shaper_rate(autorate_t *ar, int dir)
-{
-    uint32_t mn = (dir == DIR_DL) ? ar->cfg.min_dl_shaper_rate_kbps
-                                  : ar->cfg.min_ul_shaper_rate_kbps;
-    uint32_t mx = (dir == DIR_DL) ? ar->cfg.max_dl_shaper_rate_kbps
-                                  : ar->cfg.max_ul_shaper_rate_kbps;
-    if (ar->shaper_rate_kbps[dir] < mn) ar->shaper_rate_kbps[dir] = mn;
-    if (ar->shaper_rate_kbps[dir] > mx) ar->shaper_rate_kbps[dir] = mx;
-}
-
-static void set_shaper_rate(autorate_t *ar, int dir)
-{
-    uint32_t rate     = ar->shaper_rate_kbps[dir];
-    uint32_t old_rate = ar->last_shaper_rate_kbps[dir];
-
-    if (rate == old_rate)
-        return;
-
-    /* Hysteresis: skip trivial changes (< 0.5%) unless hitting a rail. */
-    uint32_t min_limit = (dir == DIR_DL) ? ar->cfg.min_dl_shaper_rate_kbps
-                                         : ar->cfg.min_ul_shaper_rate_kbps;
-    uint32_t max_limit = (dir == DIR_DL) ? ar->cfg.max_dl_shaper_rate_kbps
-                                         : ar->cfg.max_ul_shaper_rate_kbps;
-
-    uint32_t diff = (rate > old_rate) ? (rate - old_rate) : (old_rate - rate);
-    uint32_t base = old_rate ? old_rate : rate;
-    uint32_t threshold = base / 200;
-    uint32_t floor_val = (base < 5000) ? (base / 100) : 50;
-    if (threshold < floor_val) threshold = floor_val;
-
-    if (diff < threshold && rate != min_limit && rate != max_limit)
-        return;
-
-    const char *iface  = (dir == DIR_DL) ? ar->cfg.dl_if : ar->cfg.ul_if;
-    int         adjust = (dir == DIR_DL) ? ar->cfg.adjust_dl_shaper_rate
-                                         : ar->cfg.adjust_ul_shaper_rate;
-
-    if (adjust && iface[0] != '\0') {
-        if (tc_cake_set_bandwidth(ar->tc_nl, iface, rate) < 0)
-            return;
-    }
-
-    ar->last_shaper_rate_kbps[dir] = rate;
-}
-
-/* ────────────────────────────────────────────────────────────── */
-/*  Rate adjustment                                               */
-/* ────────────────────────────────────────────────────────────── */
-static void adjust_shaper_rate(autorate_t *ar, int dir, int64_t t_now_us)
-{
-    cake_config_t *c    = &ar->cfg;
-    uint32_t base       = (dir == DIR_DL) ? c->base_dl_shaper_rate_kbps
-                                           : c->base_ul_shaper_rate_kbps;
-    int64_t delay_thr   = (dir == DIR_DL) ? c->dl_owd_delta_delay_thr_us
-                                           : c->ul_owd_delta_delay_thr_us;
-    int64_t max_up_thr  = (dir == DIR_DL) ? c->dl_avg_owd_delta_max_adjust_up_thr_us
-                                           : c->ul_avg_owd_delta_max_adjust_up_thr_us;
-    int64_t max_down_thr = (dir == DIR_DL) ? c->dl_avg_owd_delta_max_adjust_down_thr_us
-                                            : c->ul_avg_owd_delta_max_adjust_down_thr_us;
-
-    switch (ar->load_condition[dir]) {
-
-    case LOAD_BB: {
-        if (t_now_us - ar->t_last_bufferbloat_us[dir] <
-                c->bufferbloat_refractory_period_us)
-            break;
-
-        int64_t avg = ar->avg_owd_delta_us[dir];
-        int64_t factor;
-        if (max_down_thr <= delay_thr) {
-            factor = c->shaper_rate_max_adjust_down_bufferbloat;
-        } else if (avg > delay_thr) {
-            factor = c->shaper_rate_min_adjust_down_bufferbloat
-                + (c->shaper_rate_max_adjust_down_bufferbloat
-                   - c->shaper_rate_min_adjust_down_bufferbloat)
-                * (avg - delay_thr)
-                / (max_down_thr - delay_thr);
-        } else {
-            factor = c->shaper_rate_min_adjust_down_bufferbloat;
-        }
-
-        ar->shaper_rate_kbps[dir] =
-            (uint32_t)((uint64_t)ar->shaper_rate_kbps[dir]
-                       * (uint64_t)factor / 1000000ULL);
-        ar->t_last_bufferbloat_us[dir] = t_now_us;
-        ar->t_last_decay_us[dir]       = t_now_us;
-        break;
-    }
-
-    case LOAD_HIGH: {
-        if (!ar->achieved_rate_updated[dir])
-            break;
-        if (t_now_us - ar->t_last_bufferbloat_us[dir] <
-                c->bufferbloat_refractory_period_us)
-            break;
-
-        int64_t avg = ar->avg_owd_delta_us[dir];
-        int64_t factor;
-        /*
-         *   avg <= max_up_thr (10ms) → full rate increase (1.04×)
-         *   max_up_thr < avg < delay_thr (30ms) → interpolate down
-         *   avg >= delay_thr → no increase (1.00×)
-         */
-        if (avg <= max_up_thr) {
-            factor = c->shaper_rate_max_adjust_up_load_high;
-        } else if (avg < delay_thr && max_up_thr < delay_thr) {
-            /* interpolate from max down to min as avg approaches delay_thr */
-            factor = c->shaper_rate_max_adjust_up_load_high
-                - (c->shaper_rate_max_adjust_up_load_high
-                   - c->shaper_rate_min_adjust_up_load_high)
-                * (avg - max_up_thr)
-                / (delay_thr - max_up_thr);
-        } else {
-            factor = c->shaper_rate_min_adjust_up_load_high;
-        }
-
-        ar->shaper_rate_kbps[dir] =
-            (uint32_t)((uint64_t)ar->shaper_rate_kbps[dir]
-                       * (uint64_t)factor / 1000000ULL);
-        ar->achieved_rate_updated[dir] = 0;
-        ar->t_last_decay_us[dir]       = t_now_us;
-        break;
-    }
-
-    case LOAD_LOW:
-    case LOAD_IDLE: {
-        if (t_now_us - ar->t_last_decay_us[dir] < c->decay_refractory_period_us)
-            break;
-
-        uint32_t rate = ar->shaper_rate_kbps[dir];
-        if (rate > base) {
-            int64_t f = c->shaper_rate_adjust_down_load_low;
-            rate = (uint32_t)((uint64_t)rate * (uint64_t)f / 1000000ULL);
-            ar->shaper_rate_kbps[dir] = (rate < base) ? base : rate;
-        } else if (rate < base) {
-            int64_t f = c->shaper_rate_adjust_up_load_low;
-            rate = (uint32_t)((uint64_t)rate * (uint64_t)f / 1000000ULL);
-            ar->shaper_rate_kbps[dir] = (rate > base) ? base : rate;
-        }
-        ar->t_last_decay_us[dir] = t_now_us;
-        break;
-    }
-    }
-
-    clamp_shaper_rate(ar, dir);
-    set_shaper_rate(ar, dir);
-}
-
-/* ────────────────────────────────────────────────────────────── */
-/*  OWD processing (called for each received ping response)       */
-/* ────────────────────────────────────────────────────────────── */
-static void process_owd(autorate_t *ar,
-                        int reflector_idx,
-                        int64_t dl_owd_us,
-                        int64_t ul_owd_us,
-                        int64_t t_now_us)
-{
-    cake_config_t *c = &ar->cfg;
-    reflector_t   *r = &ar->reflectors[reflector_idx];
-
-    if (r->dl_owd_baseline_us == 0) {
-        r->dl_owd_baseline_us = dl_owd_us;
-        r->ul_owd_baseline_us = ul_owd_us;
-        r->last_response_us   = t_now_us;
-        return;
-    }
-
-    if (dl_owd_us - r->dl_owd_baseline_us < -3000000LL ||
-        ul_owd_us - r->ul_owd_baseline_us < -3000000LL) {
-        r->dl_owd_baseline_us = dl_owd_us;
-        r->ul_owd_baseline_us = ul_owd_us;
-        r->last_response_us   = t_now_us;
-        return;
-    }
-
-    int64_t dl_alpha = (dl_owd_us > r->dl_owd_baseline_us)
-        ? c->alpha_baseline_increase
-        : c->alpha_baseline_decrease;
-    int64_t ul_alpha = (ul_owd_us > r->ul_owd_baseline_us)
-        ? c->alpha_baseline_increase
-        : c->alpha_baseline_decrease;
-
-    r->dl_owd_baseline_us =
-          dl_alpha * dl_owd_us           / 1000000LL
-        + (1000000LL - dl_alpha) * r->dl_owd_baseline_us / 1000000LL;
-    r->ul_owd_baseline_us =
-          ul_alpha * ul_owd_us           / 1000000LL
-        + (1000000LL - ul_alpha) * r->ul_owd_baseline_us / 1000000LL;
-
-    int64_t dl_delta = dl_owd_us - r->dl_owd_baseline_us;
-    int64_t ul_delta = ul_owd_us - r->ul_owd_baseline_us;
-
-    if (ar->load_condition[DIR_DL] == LOAD_HIGH ||
-        ar->load_condition[DIR_UL] == LOAD_HIGH) {
-        int64_t ae = c->alpha_delta_ewma;
-        r->dl_owd_delta_ewma_us =
-              ae * dl_delta             / 1000000LL
-            + (1000000LL - ae) * r->dl_owd_delta_ewma_us / 1000000LL;
-        r->ul_owd_delta_ewma_us =
-              ae * ul_delta             / 1000000LL
-            + (1000000LL - ae) * r->ul_owd_delta_ewma_us / 1000000LL;
-    }
-
-    int bdw = c->bufferbloat_detection_window;
-    int idx = ar->delays_idx;
-
-    ar->sum_dl_delays -= ar->dl_delays[idx];
-    ar->dl_delays[idx] = (dl_delta > c->dl_owd_delta_delay_thr_us) ? 1 : 0;
-    ar->sum_dl_delays += ar->dl_delays[idx];
-
-    ar->sum_ul_delays -= ar->ul_delays[idx];
-    ar->ul_delays[idx] = (ul_delta > c->ul_owd_delta_delay_thr_us) ? 1 : 0;
-    ar->sum_ul_delays += ar->ul_delays[idx];
-
-    ar->sum_dl_owd_deltas_us -= ar->dl_owd_deltas_us[idx];
-    ar->dl_owd_deltas_us[idx] = dl_delta;
-    ar->sum_dl_owd_deltas_us += dl_delta;
-
-    ar->sum_ul_owd_deltas_us -= ar->ul_owd_deltas_us[idx];
-    ar->ul_owd_deltas_us[idx] = ul_delta;
-    ar->sum_ul_owd_deltas_us += ul_delta;
-
-    ar->delays_idx = (idx + 1) % bdw;
-
-    /* Use the actual number of samples collected (capped at bdw)
-     * to avoid dividing the sum by the full window during warmup, which
-     * artificially deflates the average and suppresses rate increases. */
-    if (ar->delays_fill < bdw)
-        ar->delays_fill++;
-    int divisor = ar->delays_fill;
-
-    ar->avg_owd_delta_us[DIR_DL] = ar->sum_dl_owd_deltas_us / divisor;
-    ar->avg_owd_delta_us[DIR_UL] = ar->sum_ul_owd_deltas_us / divisor;
-
-    ar->bufferbloat_detected[DIR_DL] =
-        (ar->sum_dl_delays >= c->bufferbloat_detection_thr);
-    ar->bufferbloat_detected[DIR_UL] =
-        (ar->sum_ul_delays >= c->bufferbloat_detection_thr);
-
-    uint32_t high_thr_dl = (uint32_t)((uint64_t)ar->shaper_rate_kbps[DIR_DL]
-                                      * (uint64_t)c->high_load_thr / 1000000ULL);
-    uint32_t high_thr_ul = (uint32_t)((uint64_t)ar->shaper_rate_kbps[DIR_UL]
-                                      * (uint64_t)c->high_load_thr / 1000000ULL);
+    const cake_config_t *c = &ar->cfg;
+    int64_t comp[2];
 
     for (int d = 0; d < 2; d++) {
-        uint32_t ach = ar->achieved_rate_kbps[d];
-        uint32_t thr = (d == DIR_DL) ? high_thr_dl : high_thr_ul;
-        if (ar->bufferbloat_detected[d])
-            ar->load_condition[d] = LOAD_BB;
-        else if (ach >= thr)
-            ar->load_condition[d] = LOAD_HIGH;
-        else if (ach >= c->connection_active_thr_kbps)
-            ar->load_condition[d] = LOAD_LOW;
-        else
-            ar->load_condition[d] = LOAD_IDLE;
+        comp[d] = ar->shaper[d] ? 1000LL * ar->max_wire_bits[d] / ar->shaper[d] : 0;
+        ar->comp_delay_thr_us[d] = (d == DL ? c->dl_owd_delta_delay_thr_us
+                                            : c->ul_owd_delta_delay_thr_us) + comp[d];
+        ar->comp_up_thr_us[d]    = (d == DL ? c->dl_avg_owd_delta_max_adjust_up_thr_us
+                                            : c->ul_avg_owd_delta_max_adjust_up_thr_us) + comp[d];
+        ar->comp_down_thr_us[d]  = (d == DL ? c->dl_avg_owd_delta_max_adjust_down_thr_us
+                                            : c->ul_avg_owd_delta_max_adjust_down_thr_us) + comp[d];
     }
 
-    r->last_response_us            = t_now_us;
-    ar->global_last_response_us    = t_now_us;
-
-    adjust_shaper_rate(ar, DIR_DL, t_now_us);
-    adjust_shaper_rate(ar, DIR_UL, t_now_us);
+    int64_t rtt = comp[DL] + comp[UL];
+    ar->monitor_interval_us = c->monitor_achieved_rates_interval_us > 10 * rtt
+                            ? c->monitor_achieved_rates_interval_us : 10 * rtt;
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/*  ICMP pinger – shared helpers                                  */
-/* ────────────────────────────────────────────────────────────── */
-
-#define PING_PAYLOAD_MAGIC 0xCACEB00Bu
-
-/*
- * csum16 – RFC 1071 Internet checksum.
- */
-static uint16_t csum16(const void *data, size_t len)
+static void apply_shaper_rates(autorate_t *ar, int force)
 {
-    const uint16_t *word = (const uint16_t *)data;
-    uint32_t sum = 0;
-    while (len > 1) {
-        sum += *word++;
-        len -= 2;
-    }
-    if (len == 1) {
-        uint16_t last = 0;
-        *(uint8_t *)&last = *(const uint8_t *)word;
-        sum += last;
-    }
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
-    return (uint16_t)~sum;
-}
+    for (int d = 0; d < 2; d++) {
+        uint32_t rate = ar->shaper[d], old = ar->applied[d];
+        int ready = d == DL ? ar->dl_ready : ar->ul_ready;
 
-static void write_be64(uint8_t out[8], uint64_t v)
-{
-    out[0]=(uint8_t)(v>>56); out[1]=(uint8_t)(v>>48);
-    out[2]=(uint8_t)(v>>40); out[3]=(uint8_t)(v>>32);
-    out[4]=(uint8_t)(v>>24); out[5]=(uint8_t)(v>>16);
-    out[6]=(uint8_t)(v>> 8); out[7]=(uint8_t)(v);
-}
-
-static uint64_t read_be64(const uint8_t in[8])
-{
-    return ((uint64_t)in[0]<<56)|((uint64_t)in[1]<<48)|
-           ((uint64_t)in[2]<<40)|((uint64_t)in[3]<<32)|
-           ((uint64_t)in[4]<<24)|((uint64_t)in[5]<<16)|
-           ((uint64_t)in[6]<< 8)|((uint64_t)in[7]);
-}
-
-/*
- * ms_since_midnight_realtime – milliseconds since 00:00:00 UTC today.
- * Used for the ICMP Timestamp originate field (RFC 792).
- * CLOCK_REALTIME is required because the reflector's timestamps are
- * also wall-clock based.
- */
-static uint32_t ms_since_midnight_realtime(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL
-                + (uint64_t)ts.tv_nsec / 1000000ULL;
-    return (uint32_t)(ms % MS_PER_DAY);
-}
-
-/*
- * ts_diff_ms – signed difference between two ms-since-midnight values.
- *
- * Handles midnight rollover: if the raw difference exceeds ±12 hours,
- * we assume the day boundary was crossed and correct by ±86400000.
- * For valid ping RTTs (< a few seconds) this is always correct.
- */
-static int32_t ts_diff_ms(uint32_t later, uint32_t earlier)
-{
-    int32_t d = (int32_t)((int64_t)later - (int64_t)earlier);
-    if (d >  43200000) d -= (int32_t)MS_PER_DAY;
-    if (d < -43200000) d += (int32_t)MS_PER_DAY;
-    return d;
-}
-
-/* ── ICMP Echo payload (type 8, ping_type 0) ──────────────────
- *
- * We embed a magic number and a 64-bit monotonic send timestamp so
- * that any reply that doesn't carry our payload is silently ignored.
- * No ring-buffer lookup needed – the timestamp is in the payload.
- */
-struct ping_payload {
-    uint32_t magic_be;
-    uint16_t ridx_be;       /* reflector index (sanity check) */
-    uint16_t reserved_be;
-    uint8_t  t_sent_be64[8];
-};
-
-/* ────────────────────────────────────────────────────────────── */
-/*  ICMP reply callback (handles both type 0 and type 14)         */
-/* ────────────────────────────────────────────────────────────── */
-static void icmp_reply_cb(struct uloop_fd *ufd, unsigned int events)
-{
-    (void)events;
-    autorate_t *ar = container_of(ufd, autorate_t, icmp_ufd);
-
-    for (;;) {
-        uint8_t buf[1500];  /* full Ethernet MTU – prevents silent truncation */
-        struct sockaddr_in src;
-        socklen_t slen = sizeof(src);
-
-        ssize_t n = recvfrom(ufd->fd, buf, sizeof(buf), 0,
-                             (struct sockaddr *)&src, &slen);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            return;
-        }
-        if ((size_t)n < sizeof(struct iphdr)) continue;
-
-        struct iphdr *iph = (struct iphdr *)buf;
-        int ip_hlen = iph->ihl * 4;
-        if (ip_hlen < 20 ||
-            (size_t)n < (size_t)ip_hlen + sizeof(struct icmphdr))
+        if (!ready || (rate == old && !force))
             continue;
 
-        struct icmphdr *icmph = (struct icmphdr *)(buf + ip_hlen);
-
-        /* Filter by our ping ID */
-        if (ntohs(icmph->un.echo.id) != ar->ping_id) continue;
-
-        int64_t t_now_us = now_us();
-
-        /* ── ICMP Echo Reply (type 0) – ping_type 0 ─────────── */
-        if (icmph->type == ICMP_ECHOREPLY) {
-
-            const uint8_t *payload = (const uint8_t *)(icmph + 1);
-            size_t plen = (size_t)n - (size_t)ip_hlen - sizeof(*icmph);
-            if (plen < sizeof(struct ping_payload)) continue;
-
-            const struct ping_payload *pl = (const struct ping_payload *)payload;
-            if (pl->magic_be != htonl(PING_PAYLOAD_MAGIC)) continue;
-
-            /* Match reflector by source IP */
-            uint32_t src_be = src.sin_addr.s_addr;
-            int ridx = -1;
-            for (int i = 0; i < ar->no_active_reflectors; i++) {
-                if (ar->reflectors[i].addr_be == src_be) { ridx = i; break; }
-            }
-            if (ridx < 0) continue;
-
-            int64_t t_sent_us = (int64_t)read_be64(pl->t_sent_be64);
-            int64_t rtt_us    = t_now_us - t_sent_us;
-            if (rtt_us <= 0) continue;
-
-            /* RTT/2 – symmetric OWD estimate */
-            int64_t owd_us = rtt_us / 2;
-            process_owd(ar, ridx, owd_us, owd_us, t_now_us);
+        /* skip changes below 0.5% to save netlink calls (not in upstream) */
+        if (!force && rate != ar->min_rate[d] && rate != ar->max_rate[d] &&
+            rate != ar->base_rate[d]) {
+            uint32_t diff = rate > old ? rate - old : old - rate;
+            uint32_t thr = old / 200;
+            if (thr < 1) thr = 1;
+            if (diff < thr)
+                continue;
         }
 
-        /* ── ICMP Timestamp Reply (type 14) – ping_type 1 ──────
-         *
-         * True per-direction OWD via RFC 792 ICMP Timestamp:
-         *
-         *   T1 = originate_ms  (our clock, ms-since-midnight)
-         *   T2 = receive_ms    (reflector clock, ms-since-midnight)
-         *   T3 = transmit_ms   (reflector clock, ms-since-midnight)
-         *   T4 = local_rx_ms   (our clock, ms-since-midnight NOW)
-         *
-         *   UL raw  = T2 - T1   (absorbs clock offset θ as constant)
-         *   DL raw  = T4 - T3   (absorbs -θ as constant)
-         *
-         * Because we use an asymmetric EWMA baseline that tracks the
-         * running minimum, the constant clock offset cancels when
-         * computing the delta from baseline.  No NTP synchronisation
-         * with the reflector is required.
-         *
-         * If the reflector sets transmit = receive (zero processing
-         * time), T3-T2 = 0 and the calculation degrades gracefully to
-         * RTT/2 split by the measured asymmetry ratio.
-         */
-        else if (icmph->type == ICMP_TIMESTAMPREPLY) {
+        const char *ifname = d == DL ? ar->cfg.dl_if : ar->cfg.ul_if;
+        int r = tc_cake_set_bandwidth(ar->nl, ifname, ar->qdisc_kind[d], rate);
+        if (r < 0) {
+            set_error(ar, "%s: cannot change CAKE bandwidth on %s: %s",
+                      dir_name(d), ifname, tc_nl_last_error(ar->nl));
+            ar->need_resetup = 1;
+            uloop_timeout_set(&ar->if_timer, 100);
+            continue;
+        }
+        DBG(ar, "%s shaper %u -> %u kbit/s (achieved %u, load %u%%)",
+            dir_name(d), old, rate, ar->achieved[d], ar->load_pct[d]);
+        ar->applied[d] = rate;
+        ar->n_rate_changes++;
+    }
+    update_compensation(ar);
+}
 
-            size_t ts_body_off = (size_t)ip_hlen + sizeof(*icmph);
-            if ((size_t)n < ts_body_off + sizeof(struct icmp_ts_body)) continue;
+static void set_min_shaper_rates(autorate_t *ar)
+{
+    ar->shaper[DL] = ar->min_rate[DL];
+    ar->shaper[UL] = ar->min_rate[UL];
+    apply_shaper_rates(ar, 0);
+}
 
-            const struct icmp_ts_body *tsb =
-                (const struct icmp_ts_body *)(buf + ts_body_off);
+static uint32_t scale_rate(uint32_t rate, int64_t factor_fp)
+{
+    uint64_t r = (uint64_t)rate * (uint64_t)factor_fp / FP;
+    if (r == rate && factor_fp > FP) r++;
+    if (r == rate && factor_fp < FP && r > 0) r--;
+    return r > UINT32_MAX ? UINT32_MAX : (uint32_t)r;
+}
 
-            uint16_t seq = ntohs(icmph->un.echo.sequence);
-            ping_seq_slot_t *slot = &ar->ping_seq_ring[seq % PING_SEQ_RING];
+static void adjust_shaper_rate(autorate_t *ar, int d, int64_t t)
+{
+    const cake_config_t *c = &ar->cfg;
+    int64_t avg = ar->avg_delta_us[d];
+    int64_t delay_thr = ar->comp_delay_thr_us[d];
+    int64_t up_thr = ar->comp_up_thr_us[d];
+    int64_t down_thr = ar->comp_down_thr_us[d];
+    int64_t f;
 
-            /* Validate that this reply matches the slot we stored */
-            if (slot->reflector_idx < 0 || slot->t_sent_us == 0) continue;
+    if (ar->bufferbloat[d]) {
+        if (t <= ar->t_last_bufferbloat_us[d] + c->bufferbloat_refractory_period_us)
+            return;
+        if (down_thr <= delay_thr)
+            f = FP;
+        else if (avg > delay_thr)
+            f = clamp64(FP * (avg - delay_thr) / (down_thr - delay_thr), 0, FP);
+        else
+            f = 0;
+        int64_t adj = c->shaper_rate_min_adjust_down_bufferbloat_fp -
+                      f * (c->shaper_rate_min_adjust_down_bufferbloat_fp -
+                           c->shaper_rate_max_adjust_down_bufferbloat_fp) / FP;
+        ar->shaper[d] = scale_rate(ar->shaper[d], adj);
+        ar->t_last_bufferbloat_us[d] = t;
+        ar->t_last_decay_us[d] = t;
+        ar->n_bufferbloat[d]++;
+        DBG(ar, "%s bufferbloat: avg delta %lld us (thr %lld), factor %lld ppm",
+            dir_name(d), (long long)avg, (long long)delay_thr, (long long)adj);
+    } else if (ar->load_state[d] == LOAD_HIGH) {
+        if (!ar->achieved_updated[d] ||
+            t <= ar->t_last_bufferbloat_us[d] + c->bufferbloat_refractory_period_us)
+            return;
+        if (delay_thr <= up_thr)
+            f = FP;
+        else if (delay_thr - avg > 0)
+            f = clamp64(FP * (delay_thr - avg) / (delay_thr - up_thr), 0, FP);
+        else
+            f = 0;
+        int64_t adj = c->shaper_rate_min_adjust_up_load_high_fp +
+                      f * (c->shaper_rate_max_adjust_up_load_high_fp -
+                           c->shaper_rate_min_adjust_up_load_high_fp) / FP;
+        ar->shaper[d] = scale_rate(ar->shaper[d], adj);
+        ar->achieved_updated[d] = 0;
+        ar->t_last_decay_us[d] = t;
+    } else {
+        if (t <= ar->t_last_decay_us[d] + c->decay_refractory_period_us)
+            return;
+        uint32_t base = ar->base_rate[d];
+        if (ar->shaper[d] > base) {
+            uint32_t r = scale_rate(ar->shaper[d], c->shaper_rate_adjust_down_load_low_fp);
+            ar->shaper[d] = r > base ? r : base;
+        } else if (ar->shaper[d] < base) {
+            uint32_t r = scale_rate(ar->shaper[d], c->shaper_rate_adjust_up_load_low_fp);
+            ar->shaper[d] = r < base ? r : base;
+        }
+        ar->t_last_decay_us[d] = t;
+    }
+}
 
-            /* Verify source IP matches what we expected for this slot */
-            int ridx = slot->reflector_idx;
-            if (ridx >= ar->no_active_reflectors ||
-                ar->reflectors[ridx].addr_be != src.sin_addr.s_addr)
-                continue;
+static void pinger_assign(autorate_t *ar, int p, int pool_idx, int64_t t)
+{
+    pinger_t *pg = &ar->pingers[p];
+    uint16_t gen = (uint16_t)(pg->gen + 1);
+    retained_t *rt = &ar->retained[pool_idx];
 
-            uint32_t orig_ms   = slot->originate_ms;
-            uint32_t recv_ms   = ntohl(tsb->receive);
-            uint32_t tx_ms     = ntohl(tsb->transmit);
-            uint32_t local_ms  = ms_since_midnight_realtime();
-
-            /*
-             * Sanity: reject if receive < originate by more than 5 s
-             * (would imply clocks are wildly out of sync or the reflector
-             * is broken).  A 5 second tolerance covers any reasonable RTT.
-             */
-            int32_t ul_ms = ts_diff_ms(recv_ms, orig_ms);
-            int32_t dl_ms = ts_diff_ms(local_ms, tx_ms);
-
-            if (ul_ms < -5000 || ul_ms > 30000) continue;
-            if (dl_ms < -5000 || dl_ms > 30000) continue;
-
-            int64_t ul_owd_us = (int64_t)ul_ms * 1000LL;
-            int64_t dl_owd_us = (int64_t)dl_ms * 1000LL;
-
-            /* Consume slot so stale replies don't double-count */
-            slot->t_sent_us    = 0;
-            slot->reflector_idx = -1;
-
-            process_owd(ar, ridx, dl_owd_us, ul_owd_us, t_now_us);
+    memset(pg, 0, sizeof(*pg));
+    pg->gen = gen;
+    pg->pool_idx = pool_idx;
+    pg->addr_be = ar->cfg.reflectors[pool_idx];
+    pg->last_response_us = t;
+    if (ar->cfg.retain_reflector_stats && rt->valid) {
+        pg->baseline_valid = 1;
+        for (int d = 0; d < 2; d++) {
+            pg->base_us[d] = rt->base_us[d];
+            pg->ewma_us[d] = rt->ewma_us[d];
         }
     }
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/*  Ping timer callback – send one ping (echo or timestamp)       */
-/* ────────────────────────────────────────────────────────────── */
-static void ping_timer_cb(struct uloop_timeout *t)
+/* swap in the first spare, bad reflector goes to the back of the queue */
+static void replace_reflector(autorate_t *ar, int p, int64_t t, const char *why)
 {
-    autorate_t    *ar = container_of(t, autorate_t, ping_timer);
-    cake_config_t *c  = &ar->cfg;
+    pinger_t *pg = &ar->pingers[p];
+    int n = ar->no_pingers;
 
-    if (ar->no_active_reflectors <= 0 || ar->icmp_sock < 0) {
-        uloop_timeout_set(&ar->ping_timer, 1000);
+    if (ar->pool_n <= n) {
+        DBG(ar, "reflector %s %s, but no spare reflectors", ip_str(pg->addr_be), why);
+        memset(pg->offences, 0, sizeof(pg->offences));
+        pg->sum_offences = 0;
         return;
     }
 
-    if (ar->ping_rr_idx >= ar->no_active_reflectors)
-        ar->ping_rr_idx = 0;
+    int bad = ar->order[p], fresh = ar->order[n];
+    retained_t *rt = &ar->retained[bad];
+    rt->valid = ar->cfg.retain_reflector_stats && pg->baseline_valid;
+    for (int d = 0; d < 2; d++) {
+        rt->base_us[d] = pg->base_us[d];
+        rt->ewma_us[d] = pg->ewma_us[d];
+    }
 
-    int ridx = ar->ping_rr_idx++;
-    reflector_t *r = &ar->reflectors[ridx];
+    memmove(&ar->order[n], &ar->order[n + 1], (size_t)(ar->pool_n - n - 1) * sizeof(int));
+    ar->order[ar->pool_n - 1] = bad;
+    ar->order[p] = fresh;
 
-    if (r->addr_be == 0) goto out;
+    syslog(LOG_INFO, "reflector %s %s, replaced by %s",
+           ip_str(pg->addr_be), why, ip_str(ar->cfg.reflectors[fresh]));
+    pinger_assign(ar, p, fresh, t);
+    ar->n_replacements++;
+}
 
-    struct sockaddr_in dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family      = AF_INET;
-    dst.sin_addr.s_addr = r->addr_be;
+static void process_response(autorate_t *ar, int p, int64_t dl_owd, int64_t ul_owd, int64_t t);
 
-    uint16_t seq = ++ar->ping_seq;
-    int64_t  t_sent_us = now_us();
+static void handle_reply(autorate_t *ar, const icmp_reply_t *r)
+{
+    const cake_config_t *c = &ar->cfg;
+    int64_t t = now_us();
+    int64_t owd[2];
 
-    if (c->ping_type == 1) {
-        /* ── ICMP Timestamp Request (type 13) ────────────────── */
-        uint8_t pkt[sizeof(struct icmphdr) + sizeof(struct icmp_ts_body)];
-        memset(pkt, 0, sizeof(pkt));
+    if (r->id != ar->ping_id)
+        return;
+    ping_slot_t *s = &ar->ring[r->seq & (PING_RING - 1)];
+    if (s->pinger < 0 || s->pinger >= ar->no_pingers)
+        return;
+    pinger_t *pg = &ar->pingers[s->pinger];
+    if (s->gen != pg->gen || s->dst_be != r->src_be || pg->addr_be != r->src_be)
+        return;
 
-        struct icmphdr      *h   = (struct icmphdr *)pkt;
-        struct icmp_ts_body *tsb = (struct icmp_ts_body *)(h + 1);
-
-        h->type               = ICMP_TIMESTAMP;
-        h->code               = 0;
-        h->un.echo.id         = htons(ar->ping_id);
-        h->un.echo.sequence   = htons(seq);
-
-        uint32_t orig_ms = ms_since_midnight_realtime();
-        tsb->originate = htonl(orig_ms);
-        tsb->receive   = 0;
-        tsb->transmit  = 0;
-
-        h->checksum = 0;
-        h->checksum = csum16(pkt, sizeof(pkt));
-
-        /* Store in ring for reply correlation */
-        ping_seq_slot_t *slot = &ar->ping_seq_ring[seq % PING_SEQ_RING];
-        slot->t_sent_us     = t_sent_us;
-        slot->originate_ms  = orig_ms;
-        slot->reflector_idx = ridx;
-
-        (void)sendto(ar->icmp_sock, pkt, sizeof(pkt), 0,
-                     (struct sockaddr *)&dst, sizeof(dst));
-
+    if (r->type == 0 && c->ping_type == PING_ECHO) {
+        int64_t rtt = t - s->t_sent_us;
+        if (rtt <= 0)
+            return;
+        owd[DL] = owd[UL] = rtt / 2;
+    } else if (r->type == 14 && c->ping_type == PING_TIMESTAMP) {
+        if (r->ts_originate != s->originate_ms)
+            return;
+        /* RFC 792: non-standard time */
+        if (r->ts_receive >= MS_PER_DAY || r->ts_transmit >= MS_PER_DAY)
+            return;
+        uint32_t local = icmp_ms_since_midnight();
+        owd[UL] = (int64_t)icmp_ts_diff_ms(r->ts_receive, s->originate_ms) * 1000;
+        owd[DL] = (int64_t)icmp_ts_diff_ms(local, r->ts_transmit) * 1000;
     } else {
-        /* ── ICMP Echo Request (type 8) ──────────────────────── */
-        uint8_t pkt[sizeof(struct icmphdr) + sizeof(struct ping_payload)];
-        memset(pkt, 0, sizeof(pkt));
-
-        struct icmphdr      *h  = (struct icmphdr *)pkt;
-        struct ping_payload *pl = (struct ping_payload *)(h + 1);
-
-        h->type             = ICMP_ECHO;
-        h->code             = 0;
-        h->un.echo.id       = htons(ar->ping_id);
-        h->un.echo.sequence = htons(seq);
-
-        pl->magic_be    = htonl(PING_PAYLOAD_MAGIC);
-        pl->ridx_be     = htons((uint16_t)ridx);
-        pl->reserved_be = 0;
-        write_be64(pl->t_sent_be64, (uint64_t)t_sent_us);
-
-        h->checksum = 0;
-        h->checksum = csum16(pkt, sizeof(pkt));
-
-        (void)sendto(ar->icmp_sock, pkt, sizeof(pkt), 0,
-                     (struct sockaddr *)&dst, sizeof(dst));
+        return;
     }
 
-out:
-    {
-        int interval_ms = (int)((c->reflector_ping_interval_us / 1000)
-                                / ar->no_active_reflectors);
-        if (interval_ms < 10) interval_ms = 10;
-        uloop_timeout_set(&ar->ping_timer, interval_ms);
+    int p = s->pinger;
+    s->pinger = -1;
+    pg->received++;
+
+    switch (ar->state) {
+    case STATE_STALL:
+        DBG(ar, "reflector response, connection stall ended");
+        set_state(ar, STATE_RUNNING);
+        /* fall through */
+    case STATE_RUNNING:
+        process_response(ar, p, owd[DL], owd[UL], t);
+        break;
+    default:
+        break;
     }
 }
 
-static void refresh_reflector_addrs(autorate_t *ar)
+static void icmp_cb(struct uloop_fd *u, unsigned int events)
 {
-    for (int i = 0; i < ar->no_active_reflectors; i++) {
-        struct in_addr a;
-        if (inet_pton(AF_INET, ar->reflectors[i].addr, &a) == 1)
-            ar->reflectors[i].addr_be = a.s_addr;
-        else
-            ar->reflectors[i].addr_be = 0;
+    autorate_t *ar = container_of(u, autorate_t, icmp_ufd);
+    icmp_reply_t r;
+    (void)events;
+
+    for (int i = 0; i < 64 && ar->pingers_active && ar->icmp_fd == u->fd; i++) {
+        int k = icmp_recv(u->fd, &r);
+        if (k == 0)
+            break;
+        if (k > 0)
+            handle_reply(ar, &r);
     }
 }
 
-static int start_pinger(autorate_t *ar)
+static int64_t t_next_ping_us;
+
+static void ping_timer_cb(struct uloop_timeout *tm)
 {
-    ar->icmp_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (ar->icmp_sock < 0)
+    autorate_t *ar = container_of(tm, autorate_t, ping_timer);
+    const cake_config_t *c = &ar->cfg;
+
+    if (!ar->pingers_active)
+        return;
+
+    int p = ar->ping_rr;
+    ar->ping_rr = (p + 1) % ar->no_pingers;
+    pinger_t *pg = &ar->pingers[p];
+    uint16_t seq = ++ar->ping_seq;
+    ping_slot_t *s = &ar->ring[seq & (PING_RING - 1)];
+    int r;
+
+    s->pinger = (int8_t)p;
+    s->gen = pg->gen;
+    s->dst_be = pg->addr_be;
+    s->t_sent_us = now_us();
+
+    if (c->ping_type == PING_TIMESTAMP) {
+        s->originate_ms = icmp_ms_since_midnight();
+        r = icmp_send_timestamp(ar->icmp_fd, pg->addr_be, ar->ping_id, seq, s->originate_ms);
+    } else {
+        r = icmp_send_echo(ar->icmp_fd, pg->addr_be, ar->ping_id, seq);
+    }
+    if (r == 0)
+        pg->sent++;
+    else
+        DBG(ar, "ping %s: %s", ip_str(pg->addr_be), strerror(errno));
+
+    int64_t now = now_us(), step = ping_response_interval_us(ar);
+    t_next_ping_us += step;
+    if (t_next_ping_us < now || t_next_ping_us > now + 2 * step)
+        t_next_ping_us = now + step;
+    uloop_timeout_set(tm, (int)((t_next_ping_us - now + 999) / 1000));
+}
+
+static int start_pingers(autorate_t *ar)
+{
+    if (ar->pingers_active)
+        return 0;
+
+    ar->icmp_fd = icmp_open(ar->ping_id, ar->cfg.bind_ping_to_ul_if ? ar->cfg.ul_if : NULL);
+    if (ar->icmp_fd < 0) {
+        set_error(ar, "cannot open ICMP socket: %s", strerror(errno));
         return -1;
-
-    set_nonblocking(ar->icmp_sock);
-
-    ar->icmp_ufd.fd = ar->icmp_sock;
-    ar->icmp_ufd.cb = icmp_reply_cb;
-    uloop_fd_add(&ar->icmp_ufd, ULOOP_READ | ULOOP_EDGE_TRIGGER);
-
-    /* Use getpid() only — PIDs are unique per instance, so XOR-ing
-     * with time(NULL) only introduces collision risk on fast reboots. */
-    ar->ping_id     = (uint16_t)(getpid() & 0xFFFF);
-    ar->ping_seq    = 0;
-    ar->ping_rr_idx = 0;
-
-    /* Mark all ring slots as unused */
-    for (int i = 0; i < PING_SEQ_RING; i++) {
-        ar->ping_seq_ring[i].t_sent_us     = 0;
-        ar->ping_seq_ring[i].reflector_idx = -1;
     }
+    ar->icmp_ufd.fd = ar->icmp_fd;
+    ar->icmp_ufd.cb = icmp_cb;
+    uloop_fd_add(&ar->icmp_ufd, ULOOP_READ);
 
-    refresh_reflector_addrs(ar);
+    for (int i = 0; i < PING_RING; i++)
+        ar->ring[i].pinger = -1;
 
+    int64_t t = now_us();
+    for (int p = 0; p < ar->no_pingers; p++)
+        ar->pingers[p].last_response_us = t;
+    ar->t_last_start_pingers_us = t;
+    ar->pingers_active = 1;
+    t_next_ping_us = t;
     ar->ping_timer.cb = ping_timer_cb;
     uloop_timeout_set(&ar->ping_timer, 1);
     return 0;
 }
 
-static void stop_pinger(autorate_t *ar)
+static void stop_pingers(autorate_t *ar)
 {
+    if (!ar->pingers_active)
+        return;
     uloop_timeout_cancel(&ar->ping_timer);
+    uloop_fd_delete(&ar->icmp_ufd);
+    close(ar->icmp_fd);
+    ar->icmp_fd = -1;
+    ar->pingers_active = 0;
+}
 
-    if (ar->icmp_ufd.registered)
-        uloop_fd_delete(&ar->icmp_ufd);
-
-    if (ar->icmp_sock >= 0) {
-        close(ar->icmp_sock);
-        ar->icmp_sock = -1;
+static void reset_detection(autorate_t *ar)
+{
+    memset(ar->delays, 0, sizeof(ar->delays));
+    memset(ar->deltas_us, 0, sizeof(ar->deltas_us));
+    ar->delays_idx = 0;
+    for (int d = 0; d < 2; d++) {
+        ar->sum_delays[d] = 0;
+        ar->sum_deltas_us[d] = 0;
+        ar->avg_delta_us[d] = 0;
+        ar->bufferbloat[d] = 0;
     }
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/*  Reflector health check timer                                  */
-/* ────────────────────────────────────────────────────────────── */
-static void health_timer_cb(struct uloop_timeout *t)
+static void enter_idle(autorate_t *ar)
 {
-    autorate_t    *ar  = container_of(t, autorate_t, health_timer);
-    cake_config_t *c   = &ar->cfg;
-    int64_t        now = now_us();
-    int            win = c->reflector_misbehaving_detection_window;
-    int            replaced = 0;
+    set_state(ar, STATE_IDLE);
+    DBG(ar, "connection idle, pingers sleeping");
+    if (ar->cfg.min_shaper_rates_enforcement)
+        set_min_shaper_rates(ar);
+    stop_pingers(ar);
+    ar->sustained_idle = 0;
+    ar->t_sustained_idle_us = 0;
+}
 
-    if (win <= 0 || win > MAX_OFFENCE_WINDOW)
-        win = MAX_OFFENCE_WINDOW;
+static void process_response(autorate_t *ar, int p, int64_t dl_owd, int64_t ul_owd, int64_t t)
+{
+    const cake_config_t *c = &ar->cfg;
+    pinger_t *pg = &ar->pingers[p];
+    int64_t owd[2] = { dl_owd, ul_owd }, delta[2];
 
-    for (int i = 0; i < ar->no_active_reflectors; i++) {
-        reflector_t *r = &ar->reflectors[i];
+    if (!pg->baseline_valid) {
+        /* upstream starts at 100 ms; the first sample also works with clock offsets */
+        pg->base_us[DL] = owd[DL];
+        pg->base_us[UL] = owd[UL];
+        pg->baseline_valid = 1;
+    } else {
+        int64_t d0 = owd[DL] - pg->base_us[DL], d1 = owd[UL] - pg->base_us[UL];
+        int64_t a0 = d0 < 0 ? -d0 : d0, a1 = d1 < 0 ? -d1 : d1;
+        /* clock step on either side shifts dl/ul in opposite directions: reseed */
+        if (c->ping_type == PING_TIMESTAMP &&
+            ((a0 > 1000000 && a1 > 1000000 && (d0 > 0) != (d1 > 0)) || a0 + a1 > 3000000000LL)) {
+            DBG(ar, "reflector %s clock step detected, resetting baseline", ip_str(pg->addr_be));
+            pg->base_us[DL] = owd[DL];
+            pg->base_us[UL] = owd[UL];
+        } else {
+            for (int d = 0; d < 2; d++) {
+                int64_t a = owd[d] >= pg->base_us[d] ? c->alpha_baseline_increase_fp
+                                                     : c->alpha_baseline_decrease_fp;
+                pg->base_us[d] = (a * owd[d] + (FP - a) * pg->base_us[d]) / FP;
+            }
+        }
+    }
 
-        if (r->last_response_us == 0)
-            continue;
+    int64_t high_pct = c->high_load_thr_fp / 10000;
+    for (int d = 0; d < 2; d++) {
+        delta[d] = owd[d] - pg->base_us[d];
+        pg->last_owd_us[d] = owd[d];
+        pg->last_delta_us[d] = delta[d];
+    }
+    if (ar->load_pct[DL] < high_pct && ar->load_pct[UL] < high_pct) {
+        for (int d = 0; d < 2; d++)
+            pg->ewma_us[d] = (c->alpha_delta_ewma_fp * delta[d] +
+                              (FP - c->alpha_delta_ewma_fp) * pg->ewma_us[d]) / FP;
+    }
 
-        int offence = (now - r->last_response_us >
-                       c->reflector_response_deadline_us) ? 1 : 0;
+    pg->last_response_us = t;
+    ar->reflectors_last_us = t;
+    ar->global_timeout = 0;
 
-        int widx = r->offences_idx;
-        r->sum_offences  -= r->offences[widx];
-        r->offences[widx] = offence;
-        r->sum_offences  += offence;
-        r->offences_idx   = (widx + 1) % win;
+    int i = ar->delays_idx, w = c->bufferbloat_detection_window;
+    for (int d = 0; d < 2; d++) {
+        ar->sum_delays[d] -= ar->delays[d][i];
+        ar->delays[d][i] = delta[d] > ar->comp_delay_thr_us[d];
+        ar->sum_delays[d] += ar->delays[d][i];
 
-        if (r->sum_offences >= c->reflector_misbehaving_detection_thr &&
-            ar->spare_idx   <  c->no_reflectors) {
+        ar->sum_deltas_us[d] -= ar->deltas_us[d][i];
+        ar->deltas_us[d][i] = delta[d];
+        ar->sum_deltas_us[d] += delta[d];
 
-            syslog(LOG_WARNING,
-                   "replacing misbehaving reflector %s with %s "
-                   "(%d/%d misses in window)",
-                   r->addr, c->reflectors[ar->spare_idx],
-                   r->sum_offences, win);
+        ar->avg_delta_us[d] = ar->sum_deltas_us[d] / w;
+        ar->bufferbloat[d] = ar->sum_delays[d] >= c->bufferbloat_detection_thr;
+    }
+    if (++ar->delays_idx == w)
+        ar->delays_idx = 0;
 
-            snprintf(r->addr, sizeof(r->addr),
-                     "%s", c->reflectors[ar->spare_idx++]);
+    for (int d = 0; d < 2; d++) {
+        adjust_shaper_rate(ar, d, t);
+        ar->shaper[d] = (uint32_t)clamp64(ar->shaper[d], ar->min_rate[d], ar->max_rate[d]);
+    }
+    apply_shaper_rates(ar, 0);
 
-            /*
-             * Warm-start the new reflector's baseline using the median of
-             * the surviving active reflectors rather than zero.
-             *
-             * Setting baseline = 0 causes the first real sample to become
-             * the baseline immediately (the == 0 guard in process_owd).
-             * That single sample may be an outlier, and with
-             * alpha_baseline_increase = 0.001 the baseline barely moves
-             * upward afterwards.  If the new reflector's natural latency
-             * is higher than the first sample, the baseline undershoots for
-             * many minutes, making deltas look artificially elevated and
-             * triggering false bufferbloat detections that incorrectly
-             * reduce shaper rates — which is the "bufferbloat worsens over
-             * time until restart" symptom.
-             *
-             * Using the median of healthy reflectors gives a reasonable
-             * starting point that is in the right ballpark regardless of
-             * the new reflector's clock offset (the EWMA will correct the
-             * remainder within a few seconds at alpha_decrease = 0.9).
-             */
-            {
-                int64_t dl_vals[MAX_REFLECTORS];
-                int64_t ul_vals[MAX_REFLECTORS];
-                int n = 0;
-                for (int j = 0; j < ar->no_active_reflectors; j++) {
-                    if (j == i) continue;
-                    if (ar->reflectors[j].dl_owd_baseline_us > 0) {
-                        dl_vals[n] = ar->reflectors[j].dl_owd_baseline_us;
-                        ul_vals[n] = ar->reflectors[j].ul_owd_baseline_us;
-                        n++;
-                    }
+    if (c->enable_sleep_function) {
+        if (ar->load_state[DL] == LOAD_IDLE && ar->load_state[UL] == LOAD_IDLE) {
+            if (ar->sustained_idle) {
+                ar->t_sustained_idle_us += t - ar->t_last_idle_us;
+                ar->t_last_idle_us = t;
+            } else {
+                ar->sustained_idle = 1;
+                ar->t_last_idle_us = t;
+            }
+            if (ar->t_sustained_idle_us > c->sustained_idle_sleep_thr_us)
+                enter_idle(ar);
+        } else {
+            ar->sustained_idle = 0;
+            ar->t_sustained_idle_us = 0;
+        }
+    }
+}
+
+static void handle_global_ping_response_timeout(autorate_t *ar, int64_t t)
+{
+    const cake_config_t *c = &ar->cfg;
+
+    if (t - ar->reflectors_last_us < c->global_ping_response_timeout_us)
+        return;
+
+    if (!ar->global_timeout) {
+        ar->global_timeout = 1;
+        if (c->min_shaper_rates_enforcement)
+            set_min_shaper_rates(ar);
+        syslog(LOG_WARNING, "no reflector response for %lld s%s",
+               (long long)(c->global_ping_response_timeout_us / 1000000),
+               c->ping_type == PING_TIMESTAMP
+                   ? " (do your reflectors answer ICMP timestamp requests?)" : "");
+    }
+    if (t - ar->t_last_start_pingers_us >= c->global_ping_response_timeout_us) {
+        DBG(ar, "restarting pingers");
+        stop_pingers(ar);
+        start_pingers(ar);
+    }
+}
+
+static int64_t t_next_rate_us;
+
+static void rate_timer_cb(struct uloop_timeout *tm)
+{
+    autorate_t *ar = container_of(tm, autorate_t, rate_timer);
+    const cake_config_t *c = &ar->cfg;
+
+    rate_monitor_update(&ar->rm, &ar->achieved[DL], &ar->achieved[UL]);
+
+    int64_t high_pct = c->high_load_thr_fp / 10000;
+    for (int d = 0; d < 2; d++) {
+        ar->achieved_updated[d] = 1;
+        ar->load_pct[d] = ar->shaper[d]
+            ? (uint32_t)((uint64_t)ar->achieved[d] * 100 / ar->shaper[d]) : 0;
+        if (ar->load_pct[d] > high_pct)
+            ar->load_state[d] = LOAD_HIGH;
+        else if (ar->achieved[d] > c->connection_active_thr_kbps)
+            ar->load_state[d] = LOAD_LOW;
+        else
+            ar->load_state[d] = LOAD_IDLE;
+    }
+
+    int64_t t = now_us();
+    int traffic = ar->achieved[DL] > c->connection_stall_thr_kbps &&
+                  ar->achieved[UL] > c->connection_stall_thr_kbps;
+
+    switch (ar->state) {
+    case STATE_RUNNING:
+        if (t - ar->reflectors_last_us > c->stall_detection_thr * ping_response_interval_us(ar)) {
+            handle_global_ping_response_timeout(ar, t);
+            if (!traffic && ar->state == STATE_RUNNING) {
+                DBG(ar, "no reflector response and no traffic: connection stall");
+                set_state(ar, STATE_STALL);
+                ar->n_stalls++;
+            }
+        }
+        break;
+    case STATE_IDLE:
+        if (ar->achieved[DL] > c->connection_active_thr_kbps ||
+            ar->achieved[UL] > c->connection_active_thr_kbps) {
+            DBG(ar, "traffic resumed (%u/%u kbit/s), waking pingers",
+                ar->achieved[DL], ar->achieved[UL]);
+            set_state(ar, STATE_RUNNING);
+            start_pingers(ar);
+            ar->t_sustained_idle_us = 0;
+            ar->sustained_idle = 0;
+            ar->reflectors_last_us = t + 2 * c->reflector_ping_interval_us;
+            ar->t_last_health_us = ar->reflectors_last_us;
+        }
+        break;
+    case STATE_STALL:
+        if (traffic) {
+            DBG(ar, "traffic above stall threshold, connection stall ended");
+            set_state(ar, STATE_RUNNING);
+        }
+        handle_global_ping_response_timeout(ar, t);
+        break;
+    default:
+        return;
+    }
+
+    t = now_us();
+    t_next_rate_us += ar->monitor_interval_us;
+    if (t_next_rate_us < t || t_next_rate_us > t + 2 * ar->monitor_interval_us)
+        t_next_rate_us = t + ar->monitor_interval_us;
+    uloop_timeout_set(tm, (int)((t_next_rate_us - t + 999) / 1000));
+}
+
+static void health_check(autorate_t *ar, int64_t t)
+{
+    const cake_config_t *c = &ar->cfg;
+    int n = ar->no_pingers;
+
+    if (t > ar->t_last_replacement_us + c->reflector_replacement_interval_us) {
+        ar->t_last_replacement_us = t;
+        replace_reflector(ar, (int)(config_random() % (uint32_t)n), t, "rotated (periodic)");
+        return;
+    }
+
+    if (t > ar->t_last_comparison_us + c->reflector_comparison_interval_us) {
+        ar->t_last_comparison_us = t;
+
+        int all_valid = 1;
+        for (int p = 0; p < n; p++)
+            all_valid &= ar->pingers[p].baseline_valid;
+
+        if (all_valid && n > 1) {
+            int64_t min_sum = INT64_MAX, min_ewma[2] = { INT64_MAX, INT64_MAX };
+            for (int p = 0; p < n; p++) {
+                pinger_t *pg = &ar->pingers[p];
+                int64_t sum = pg->base_us[DL] + pg->base_us[UL];
+                if (sum < min_sum) min_sum = sum;
+                for (int d = 0; d < 2; d++)
+                    if (pg->ewma_us[d] < min_ewma[d]) min_ewma[d] = pg->ewma_us[d];
+            }
+            for (int p = 0; p < n; p++) {
+                pinger_t *pg = &ar->pingers[p];
+                int64_t sum = pg->base_us[DL] + pg->base_us[UL];
+                if (sum - min_sum > c->reflector_sum_owd_baselines_delta_thr_us) {
+                    replace_reflector(ar, p, t, "has a high baseline");
+                    return;
                 }
-                if (n > 0) {
-                    /* Simple selection sort for small n (≤ 20) */
-                    for (int a = 0; a < n - 1; a++) {
-                        for (int b = a + 1; b < n; b++) {
-                            if (dl_vals[b] < dl_vals[a]) {
-                                int64_t tmp = dl_vals[a];
-                                dl_vals[a] = dl_vals[b];
-                                dl_vals[b] = tmp;
-                                tmp = ul_vals[a];
-                                ul_vals[a] = ul_vals[b];
-                                ul_vals[b] = tmp;
-                            }
-                        }
+                for (int d = 0; d < 2; d++) {
+                    if (pg->ewma_us[d] - min_ewma[d] > c->reflector_owd_delta_ewma_delta_thr_us) {
+                        replace_reflector(ar, p, t, d == DL ? "is jittery (download)"
+                                                            : "is jittery (upload)");
+                        return;
                     }
-                    r->dl_owd_baseline_us = dl_vals[n / 2];
-                    r->ul_owd_baseline_us = ul_vals[n / 2];
-                } else {
-                    r->dl_owd_baseline_us = 0;
-                    r->ul_owd_baseline_us = 0;
                 }
             }
+        }
+    }
 
-            r->dl_owd_delta_ewma_us = 0;
-            r->ul_owd_delta_ewma_us = 0;
-            r->last_response_us     = 0;
-            memset(r->offences, 0, sizeof(r->offences));
-            r->sum_offences = 0;
-            r->offences_idx = 0;
+    /* at most one replacement per check */
+    int idx = ar->offences_idx, replaced = 0;
+    for (int p = 0; p < n; p++) {
+        pinger_t *pg = &ar->pingers[p];
+        uint8_t off = (t - pg->last_response_us) > c->reflector_response_deadline_us;
+        pg->sum_offences += off - pg->offences[idx];
+        pg->offences[idx] = off;
+        if (pg->sum_offences >= c->reflector_misbehaving_detection_thr && !replaced) {
+            replace_reflector(ar, p, t, "is not responding");
             replaced = 1;
         }
     }
-
-    if (replaced)
-        refresh_reflector_addrs(ar);
-
-    uloop_timeout_set(t, (int)(c->reflector_health_check_interval_us / 1000));
+    if (++ar->offences_idx >= c->reflector_misbehaving_detection_window)
+        ar->offences_idx = 0;
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/*  Rate-monitor timer callback (~200 ms)                         */
-/* ────────────────────────────────────────────────────────────── */
-static void rate_timer_cb(struct uloop_timeout *t)
+static void health_timer_cb(struct uloop_timeout *tm)
 {
-    autorate_t    *ar = container_of(t, autorate_t, rate_timer);
-    cake_config_t *c  = &ar->cfg;
+    autorate_t *ar = container_of(tm, autorate_t, health_timer);
+    int64_t t = now_us();
 
-    int64_t elapsed = rate_monitor_update(&ar->rm,
-                                          &ar->achieved_rate_kbps[DIR_DL],
-                                          &ar->achieved_rate_kbps[DIR_UL]);
+    if (ar->state == STATE_RUNNING && t > ar->t_last_health_us) {
+        health_check(ar, t);
+        ar->t_last_health_us = t;
+    }
+    uloop_timeout_set(tm, (int)(ar->cfg.reflector_health_check_interval_us / 1000));
+}
 
-    ar->achieved_rate_updated[DIR_DL] = 1;
-    ar->achieved_rate_updated[DIR_UL] = 1;
+static uint32_t read_mtu(const char *ifname)
+{
+    char path[64], buf[16];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/mtu", ifname);
+    FILE *f = fopen(path, "re");
+    uint32_t mtu = 1500;
+    if (f) {
+        if (fgets(buf, sizeof(buf), f))
+            mtu = (uint32_t)strtoul(buf, NULL, 10);
+        fclose(f);
+    }
+    return mtu ? mtu : 1500;
+}
 
-    /* Drift compensation */
-    int64_t target = c->monitor_achieved_rates_interval_us;
-    int64_t next   = target - (elapsed - target);
-    if (next < target) next = target;
+static void compute_max_wire_bits(autorate_t *ar)
+{
+    const cake_config_t *c = &ar->cfg;
+    int32_t overhead = c->cake_overhead == INT32_MIN ? 14 : c->cake_overhead;
 
-    /* Stall detection
-     *
-     * The threshold must be based on the per-reflector ping interval, not
-     * the global interval divided by reflector count.  Each reflector is
-     * pinged every reflector_ping_interval_s seconds; if none of them have
-     * replied for (stall_detection_thr × per-reflector interval) we declare
-     * a stall.  Using the short global interval caused false stalls whenever
-     * a single reflector missed one response.
-     *
-     * We also require the rate check to persist for two consecutive monitor
-     * intervals before logging, which suppresses single-sample glitches.
-     */
-    int64_t now = now_us();
-    {
-        int64_t per_reflector_interval_us = c->reflector_ping_interval_us;
-        int64_t stall_thr_us =
-            (int64_t)c->stall_detection_thr * per_reflector_interval_us;
+    for (int d = 0; d < 2; d++) {
+        uint32_t bits = 8 * (read_mtu(d == DL ? c->dl_if : c->ul_if) + (uint32_t)overhead);
+        if (c->cake_atm == 1)
+            bits = 424 * ((bits + 376) / 384);
+        ar->max_wire_bits[d] = bits;
+    }
+}
 
-        int64_t last_response = ar->global_last_response_us > 0
-            ? ar->global_last_response_us
-            : ar->t_started_us;
+static void make_opts(const autorate_t *ar, int d, cake_opts_t *o)
+{
+    const cake_config_t *c = &ar->cfg;
+    memset(o, 0, sizeof(*o));
+    o->overhead  = c->cake_overhead;
+    o->mpu       = c->cake_mpu;
+    o->atm       = (uint32_t)c->cake_atm;
+    o->nat       = (uint32_t)c->cake_nat;
+    o->diffserv  = (uint32_t)c->cake_diffserv;
+    o->rtt_us    = c->cake_rtt_us;
+    o->memlimit  = c->cake_memlimit_bytes;
+    o->split_gso = (uint32_t)c->cake_split_gso;
+    if (d == DL) {
+        o->flow_mode = (uint32_t)c->cake_dl_flow_mode;
+        o->ingress   = ar->dl_ifb_mode;
+    } else {
+        o->flow_mode   = (uint32_t)c->cake_ul_flow_mode;
+        o->wash        = (uint32_t)c->cake_wash;
+        o->ack_filter  = (uint32_t)c->cake_ack_filter;
+        o->try_cake_mq = (uint32_t)c->cake_mq;
+    }
+}
 
-        if (now - last_response > stall_thr_us &&
-            ar->achieved_rate_kbps[DIR_DL] < c->connection_stall_thr_kbps &&
-            ar->achieved_rate_kbps[DIR_UL] < c->connection_stall_thr_kbps) {
-            if (ar->main_state != STATE_STALL) {
-                ar->main_state = STATE_STALL;
-                if (ar->global_last_response_us == 0)
-                    syslog(LOG_WARNING,
-                           "no ping responses received since startup "
-                           "(ping_type=%d) – reflectors may not support "
-                           "this ICMP type; check reflector list or set "
-                           "ping_type=0 for ICMP Echo",
-                           c->ping_type);
-                else
-                    syslog(LOG_WARNING, "connection stall detected");
-            }
-        } else if (ar->main_state == STATE_STALL &&
-                   ar->global_last_response_us > 0) {
-            ar->main_state = STATE_RUNNING;
-            syslog(LOG_INFO, "connection recovered from stall");
-        }
+static void qdisc_teardown(autorate_t *ar)
+{
+    const cake_config_t *c = &ar->cfg;
+    if (ar->dl_ready || ar->created_ifb)
+        tc_dl_teardown(ar->nl, c->ul_if, c->dl_if, ar->dl_ifb_mode, ar->created_ifb);
+    if (ar->ul_ready)
+        tc_ul_teardown(ar->nl, c->ul_if);
+    if (ar->dl_ready || ar->ul_ready)
+        syslog(LOG_INFO, "CAKE qdiscs removed");
+    ar->dl_ready = ar->ul_ready = 0;
+    ar->created_ifb = 0;
+}
+
+static int qdisc_setup(autorate_t *ar)
+{
+    const cake_config_t *c = &ar->cfg;
+    cake_opts_t o;
+    int r;
+
+    if (!if_nametoindex(c->ul_if)) {
+        set_error(ar, "waiting for interface %s", c->ul_if);
+        return -1;
     }
 
-    /* Update LuCI status file every rate-monitor tick */
-    write_status_file(ar);
+    ar->dl_ifb_mode = tc_link_is_ifb(ar->nl, c->dl_if) != 0;
 
-    int ms = (int)((next / 1000) & 0x7FFFFFFF);
-    uloop_timeout_set(t, ms);
+    make_opts(ar, UL, &o);
+    r = tc_ul_setup(ar->nl, c->ul_if, ar->shaper[UL], &o, &ar->qdisc_kind[UL]);
+    if (r < 0) {
+        set_error(ar, "upload: %s", tc_nl_last_error(ar->nl));
+        return -1;
+    }
+    ar->ul_ready = 1;
+
+    make_opts(ar, DL, &o);
+    r = tc_dl_setup(ar->nl, c->ul_if, c->dl_if, ar->dl_ifb_mode, ar->shaper[DL], &o,
+                    &ar->created_ifb, &ar->qdisc_kind[DL]);
+    if (r < 0) {
+        set_error(ar, "download: %s", tc_nl_last_error(ar->nl));
+        ar->dl_ready = 1;
+        qdisc_teardown(ar);
+        return -1;
+    }
+    ar->dl_ready = 1;
+
+    ar->ul_ifindex = if_nametoindex(c->ul_if);
+    ar->dl_ifindex = if_nametoindex(c->dl_if);
+    ar->applied[DL] = ar->shaper[DL];
+    ar->applied[UL] = ar->shaper[UL];
+    ar->n_setups++;
+    compute_max_wire_bits(ar);
+    update_compensation(ar);
+    set_error(ar, "%s", "");
+    return 0;
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/*  Sliding-window allocation                                     */
-/* ────────────────────────────────────────────────────────────── */
-static int init_windows(autorate_t *ar)
+static void enter_running(autorate_t *ar)
 {
-    int w = ar->cfg.bufferbloat_detection_window;
-    ar->dl_delays        = calloc((size_t)w, sizeof(int));
-    ar->ul_delays        = calloc((size_t)w, sizeof(int));
-    ar->dl_owd_deltas_us = calloc((size_t)w, sizeof(int64_t));
-    ar->ul_owd_deltas_us = calloc((size_t)w, sizeof(int64_t));
-    return (ar->dl_delays && ar->ul_delays &&
-            ar->dl_owd_deltas_us && ar->ul_owd_deltas_us) ? 0 : -1;
+    int64_t t = now_us();
+
+    rate_monitor_init(&ar->rm, ar->cfg.dl_if, ar->cfg.ul_if);
+    reset_detection(ar);
+
+    for (int d = 0; d < 2; d++) {
+        ar->t_last_bufferbloat_us[d] = t;
+        ar->t_last_decay_us[d] = t;
+        ar->load_state[d] = LOAD_IDLE;
+        ar->load_pct[d] = 0;
+        ar->achieved[d] = 0;
+        ar->achieved_updated[d] = 0;
+    }
+    /* path may have changed (PPPoE reconnect etc.) */
+    for (int p = 0; p < ar->no_pingers; p++)
+        ar->pingers[p].baseline_valid = 0;
+    for (int i = 0; i < ar->pool_n; i++)
+        ar->retained[i].valid = 0;
+
+    ar->reflectors_last_us = t;
+    ar->t_last_health_us = t;
+    ar->t_last_replacement_us = t;
+    ar->t_last_comparison_us = t;
+    ar->global_timeout = 0;
+    ar->sustained_idle = 0;
+    ar->t_sustained_idle_us = 0;
+
+    set_state(ar, STATE_RUNNING);
+    syslog(LOG_INFO, "running: download %s %u kbit/s, upload %s %u kbit/s, %s pings to %d of %d reflectors",
+           ar->cfg.dl_if, ar->shaper[DL], ar->cfg.ul_if, ar->shaper[UL],
+           ar->cfg.ping_type == PING_TIMESTAMP ? "ICMP timestamp" : "ICMP echo",
+           ar->no_pingers, ar->pool_n);
+
+    start_pingers(ar);
+
+    t_next_rate_us = now_us();
+    ar->rate_timer.cb = rate_timer_cb;
+    uloop_timeout_set(&ar->rate_timer, (int)(ar->monitor_interval_us / 1000));
+    ar->health_timer.cb = health_timer_cb;
+    uloop_timeout_set(&ar->health_timer, (int)(ar->cfg.reflector_health_check_interval_us / 1000));
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/*  Signal handler                                                */
-/* ────────────────────────────────────────────────────────────── */
-static void handle_signal(int sig)
+static void leave_running(autorate_t *ar)
 {
-    (void)sig;
-    uloop_end();
+    stop_pingers(ar);
+    uloop_timeout_cancel(&ar->rate_timer);
+    uloop_timeout_cancel(&ar->health_timer);
+    rate_monitor_close(&ar->rm);
+    qdisc_teardown(ar);
+    ar->shaper[DL] = ar->base_rate[DL];
+    ar->shaper[UL] = ar->base_rate[UL];
+    for (int d = 0; d < 2; d++) {
+        ar->achieved[d] = 0;
+        ar->load_state[d] = LOAD_IDLE;
+        ar->load_pct[d] = 0;
+    }
+    set_state(ar, STATE_WAITING);
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/*  Interface up/down recovery (if_up_check_interval_us)          */
-/* ────────────────────────────────────────────────────────────── */
-/*
- * if_up_timer_cb – polls for WAN interface presence every
- * if_up_check_interval_us microseconds.
- *
- * On PPPoE/DHCP reconnects the WAN interface disappears and reappears.
- * While it is absent we pause pinging and rate adjustments so the daemon
- * does not burn through all spare reflectors or drive rates to their
- * minimums on a link that is simply renegotiating.
- *
- * When the interface comes back we re-run cake_setup() to recreate the
- * CAKE qdiscs and restart the pinger from scratch.
- */
-static void if_up_timer_cb(struct uloop_timeout *t)
+static void try_setup(autorate_t *ar)
 {
-    autorate_t    *ar = container_of(t, autorate_t, if_up_timer);
-    cake_config_t *c  = &ar->cfg;
+    if (qdisc_setup(ar) == 0)
+        enter_running(ar);
+}
 
-    int iface_present = (if_nametoindex(c->ul_if) != 0);
+static void if_timer_cb(struct uloop_timeout *tm)
+{
+    autorate_t *ar = container_of(tm, autorate_t, if_timer);
+    const cake_config_t *c = &ar->cfg;
 
-    if (!iface_present && ar->link_up) {
-        /* Interface just disappeared */
-        ar->link_up = 0;
-        syslog(LOG_WARNING,
-               "WAN interface '%s' disappeared – pausing rate control",
-               c->ul_if);
-
-        /* Stop pinger so we don't flood with unanswerable pings */
-        stop_pinger(ar);
-
-        /* Tear down CAKE qdiscs; they will be recreated on recovery */
-        cake_teardown(ar);
-
-        /* Reset shaper rates to base so we start fresh on reconnect */
-        ar->shaper_rate_kbps[DIR_DL] = c->base_dl_shaper_rate_kbps;
-        ar->shaper_rate_kbps[DIR_UL] = c->base_ul_shaper_rate_kbps;
-
-    } else if (iface_present && !ar->link_up) {
-        /* Interface just came back up */
-        syslog(LOG_INFO,
-               "WAN interface '%s' reappeared – resuming rate control",
-               c->ul_if);
-
-        if (cake_setup(ar) < 0) {
-            syslog(LOG_ERR,
-                   "if_up: CAKE re-setup failed on '%s', will retry",
-                   c->ul_if);
-            /* Don't flip link_up; retry next interval */
-        } else {
-            ar->link_up = 1;
-
-            /* Reset OWD state so the new link gets a fresh baseline */
-            int bdw = c->bufferbloat_detection_window;
-            memset(ar->dl_delays,        0, (size_t)bdw * sizeof(*ar->dl_delays));
-            memset(ar->ul_delays,        0, (size_t)bdw * sizeof(*ar->ul_delays));
-            memset(ar->dl_owd_deltas_us, 0, (size_t)bdw * sizeof(*ar->dl_owd_deltas_us));
-            memset(ar->ul_owd_deltas_us, 0, (size_t)bdw * sizeof(*ar->ul_owd_deltas_us));
-            ar->delays_idx             = 0;
-            ar->delays_fill            = 0;
-            ar->sum_dl_delays          = 0;
-            ar->sum_ul_delays          = 0;
-            ar->sum_dl_owd_deltas_us   = 0;
-            ar->sum_ul_owd_deltas_us   = 0;
-            ar->global_last_response_us = 0;
-
-            for (int i = 0; i < ar->no_active_reflectors; i++) {
-                reflector_t *r = &ar->reflectors[i];
-                r->dl_owd_baseline_us   = 0;
-                r->ul_owd_baseline_us   = 0;
-                r->dl_owd_delta_ewma_us = 0;
-                r->ul_owd_delta_ewma_us = 0;
-                r->last_response_us     = 0;
-                memset(r->offences, 0, sizeof(r->offences));
-                r->sum_offences = 0;
-                r->offences_idx = 0;
-            }
-
-            if (start_pinger(ar) < 0)
-                syslog(LOG_ERR, "if_up: failed to restart pinger: %m");
-        }
-
-    } else if (iface_present && ar->link_up && !ar->ul_setup_done &&
-               c->adjust_ul_shaper_rate && c->ul_if[0]) {
-        cake_qdisc_opts_t ul_opts = make_ul_opts(c);
-        if (tc_ul_setup(ar->tc_nl, c->ul_if,
-                        ar->shaper_rate_kbps[DIR_UL], &ul_opts) == 0) {
-            ar->ul_setup_done = 1;
-            ar->last_shaper_rate_kbps[DIR_UL] = ar->shaper_rate_kbps[DIR_UL];
-            syslog(LOG_INFO, "if_up: UL path ready on '%s'", c->ul_if);
+    if (ar->state == STATE_WAITING) {
+        try_setup(ar);
+    } else {
+        unsigned int ul = if_nametoindex(c->ul_if), dl = if_nametoindex(c->dl_if);
+        const char *why = NULL;
+        if (ar->need_resetup)
+            why = "qdisc update failed";
+        else if (!ul)
+            why = "upload interface disappeared";
+        else if (ul != ar->ul_ifindex)
+            why = "upload interface was recreated";
+        else if (!dl || dl != ar->dl_ifindex)
+            why = "download interface changed";
+        else if (tc_verify(ar->nl, c->ul_if, c->dl_if, ar->dl_ifb_mode) == 0)
+            why = tc_nl_last_error(ar->nl);
+        if (why) {
+            syslog(LOG_WARNING, "%s, re-initialising shaping", why);
+            ar->need_resetup = 0;
+            leave_running(ar);
+            try_setup(ar);
         }
     }
-
-    int interval_ms = (int)(c->if_up_check_interval_us / 1000);
-    if (interval_ms < 1000) interval_ms = 1000;  /* minimum 1 s */
-    uloop_timeout_set(t, interval_ms);
+    uloop_timeout_set(tm, (int)(c->if_up_check_interval_us / 1000));
 }
 
-/* ────────────────────────────────────────────────────────────── */
-/*  main                                                          */
-/* ────────────────────────────────────────────────────────────── */
-int main(int argc, char *argv[])
+static void link_event_cb(struct uloop_fd *u, unsigned int events)
 {
-    const char *section = (argc > 1) ? argv[1] : "primary";
+    autorate_t *ar = container_of(u, autorate_t, link_ufd);
+    (void)events;
+    if (tc_link_monitor_drain(u->fd))
+        uloop_timeout_set(&ar->if_timer, 300);
+}
 
-    openlog("cake-autorate", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+static void startup_cb(struct uloop_timeout *tm)
+{
+    autorate_t *ar = container_of(tm, autorate_t, startup_timer);
+    try_setup(ar);
+    ar->if_timer.cb = if_timer_cb;
+    uloop_timeout_set(&ar->if_timer, (int)(ar->cfg.if_up_check_interval_us / 1000));
+}
 
-    autorate_t ar;
-    memset(&ar, 0, sizeof(ar));
-    ar.icmp_sock  = -1;
-    ar.rm.rx_fd   = -1;
-    ar.rm.tx_fd   = -1;
+static void usage(void)
+{
+    fprintf(stderr,
+            "darkmoon " DARKMOON_VERSION " - adaptive CAKE bandwidth controller\n"
+            "usage: darkmoon [-d] [-f] [instance]\n"
+            "  -d  debug logging (same as option debug '1')\n"
+            "  -f  run even if the instance is disabled in UCI\n"
+            "status: ubus call darkmoon.<instance> status\n");
+}
 
-    /* ── Load configuration ──────────────────────────────────── */
-    if (config_load(section, &ar.cfg) < 0) {
-        fprintf(stderr, "cake-autorate: failed to load UCI config '%s'\n",
-                section);
-        syslog(LOG_ERR, "failed to load UCI config section '%s'", section);
+int main(int argc, char **argv)
+{
+    autorate_t *ar = &AR;
+    const char *section = "primary";
+    int force_debug = 0, force_enable = 0, opt;
+
+    while ((opt = getopt(argc, argv, "dfh")) != -1) {
+        switch (opt) {
+        case 'd': force_debug = 1; break;
+        case 'f': force_enable = 1; break;
+        default:  usage(); return opt == 'h' ? 0 : 1;
+        }
+    }
+    if (optind < argc)
+        section = argv[optind];
+
+    openlog("darkmoon", LOG_PID | (isatty(2) ? LOG_PERROR : 0), LOG_DAEMON);
+
+    memset(ar, 0, sizeof(*ar));
+    ar->icmp_fd = -1;
+    ar->link_ufd.fd = -1;
+    ar->rm.fd[0] = ar->rm.fd[1] = -1;
+    ar->t_started_us = ar->t_state_us = now_us();
+
+    if (config_load(section, &ar->cfg) < 0) {
+        fprintf(stderr, "darkmoon: invalid configuration for instance '%s' (see logread)\n", section);
         return 1;
     }
-
-    if (!ar.cfg.enabled) {
-        syslog(LOG_INFO, "instance '%s' disabled, exiting", section);
+    cake_config_t *c = &ar->cfg;
+    if (force_debug)
+        c->debug = 1;
+    if (!c->enabled && !force_enable) {
+        syslog(LOG_INFO, "instance '%s' is disabled", section);
         return 0;
     }
+    setlogmask(LOG_UPTO(c->debug ? LOG_DEBUG : LOG_INFO));
 
-    if (ar.cfg.no_pingers < 1) {
-        syslog(LOG_ERR, "no_pingers must be >= 1");
-        return 1;
+    /* adjust_*=0 pins the rate at base, like upstream */
+    uint32_t mn[2] = { c->min_dl_shaper_rate_kbps, c->min_ul_shaper_rate_kbps };
+    uint32_t bs[2] = { c->base_dl_shaper_rate_kbps, c->base_ul_shaper_rate_kbps };
+    uint32_t mx[2] = { c->max_dl_shaper_rate_kbps, c->max_ul_shaper_rate_kbps };
+    int adj[2] = { c->adjust_dl_shaper_rate, c->adjust_ul_shaper_rate };
+    for (int d = 0; d < 2; d++) {
+        ar->base_rate[d] = bs[d];
+        ar->min_rate[d] = adj[d] ? mn[d] : bs[d];
+        ar->max_rate[d] = adj[d] ? mx[d] : bs[d];
+        ar->shaper[d] = bs[d];
+        ar->qdisc_kind[d] = "cake";
     }
 
-    /* ── Allocate OWD sliding windows ────────────────────────── */
-    if (init_windows(&ar) < 0) {
-        syslog(LOG_ERR, "out of memory allocating OWD windows");
-        return 1;
-    }
+    ar->pool_n = c->no_reflectors;
+    ar->no_pingers = c->no_pingers;
+    for (int i = 0; i < ar->pool_n; i++)
+        ar->order[i] = i;
+    for (int p = 0; p < ar->no_pingers; p++)
+        pinger_assign(ar, p, ar->order[p], ar->t_started_us);
 
-    /* Active reflectors = first min(no_pingers, no_reflectors) entries. */
-    ar.no_active_reflectors =
-        (ar.cfg.no_pingers < ar.cfg.no_reflectors)
-        ? ar.cfg.no_pingers
-        : ar.cfg.no_reflectors;
-    ar.spare_idx = ar.no_active_reflectors;
+    if (c->debug && c->bufferbloat_refractory_period_us <
+                    c->bufferbloat_detection_window * ping_response_interval_us(ar))
+        syslog(LOG_DEBUG, "warning: bufferbloat_refractory_period is shorter than the time to "
+                          "refill the detection window; consider increasing it");
+    if (c->reflector_response_deadline_us < 2 * c->reflector_ping_interval_us)
+        syslog(LOG_NOTICE, "reflector_response_deadline_s < 2 x reflector_ping_interval_s; "
+                           "healthy reflectors may be replaced");
 
-    for (int i = 0; i < ar.no_active_reflectors; i++)
-        snprintf(ar.reflectors[i].addr, 64, "%s", ar.cfg.reflectors[i]);
+    ar->ping_id = (uint16_t)(getpid() & 0xffff);
+    ar->state = STATE_WAITING;
+    update_compensation(ar);
 
-    /* Initial shaper rates */
-    ar.shaper_rate_kbps[DIR_DL] = ar.cfg.base_dl_shaper_rate_kbps;
-    ar.shaper_rate_kbps[DIR_UL] = ar.cfg.base_ul_shaper_rate_kbps;
-    ar.link_up = 1;  /* assume up at start; if_up_timer will correct if wrong */
-
-    /* Status file for LuCI – written every rate-monitor tick */
-    ar.t_started_us = now_us();
-
-    ar.ping_response_interval_us =
-        ar.cfg.reflector_ping_interval_us / ar.no_active_reflectors;
-
-    /* ── Open netlink socket ─────────────────────────────────── */
-    ar.tc_nl = tc_nl_open();
-    if (!ar.tc_nl) {
-        syslog(LOG_ERR, "tc_netlink: failed to open netlink socket");
-        goto err_free_windows;
-    }
-
-    /* ── Create CAKE qdiscs (replaces SQM script) ────────────── */
-    if (cake_setup(&ar) < 0) {
-        syslog(LOG_ERR, "CAKE setup failed – check interface names and permissions");
-        goto err_teardown;  /* runs cake_teardown() to clean up partial DL setup */
-    }
-
-    /* ── Startup wait ────────────────────────────────────────── */
-    if (ar.cfg.startup_wait_us > 0)
-        usleep((unsigned int)ar.cfg.startup_wait_us);
-
-    /* ── Initialise rate monitor ─────────────────────────────── */
-    rate_monitor_init(&ar.rm, ar.cfg.dl_if, ar.cfg.ul_if);
-
-    /* ── uloop event loop ────────────────────────────────────── */
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
     uloop_init();
-    signal(SIGINT,  handle_signal);
-    signal(SIGTERM, handle_signal);
 
-    if (start_pinger(&ar) < 0) {
-        syslog(LOG_ERR, "failed to start integrated pinger (raw ICMP)");
-        goto err_teardown;
+    ar->nl = tc_nl_open();
+    if (!ar->nl) {
+        syslog(LOG_ERR, "cannot open netlink socket");
+        return 1;
     }
 
-    ar.rate_timer.cb = rate_timer_cb;
-    uloop_timeout_set(&ar.rate_timer,
-        (int)(ar.cfg.monitor_achieved_rates_interval_us / 1000));
-
-    ar.health_timer.cb = health_timer_cb;
-    uloop_timeout_set(&ar.health_timer,
-        (int)(ar.cfg.reflector_health_check_interval_us / 1000));
-
-    /* Feature: interface recovery – only arm if interval is configured */
-    if (ar.cfg.if_up_check_interval_us > 0) {
-        ar.if_up_timer.cb = if_up_timer_cb;
-        int if_up_ms = (int)(ar.cfg.if_up_check_interval_us / 1000);
-        if (if_up_ms < 1000) if_up_ms = 1000;
-        uloop_timeout_set(&ar.if_up_timer, if_up_ms);
+    int lfd = tc_link_monitor_open();
+    if (lfd >= 0) {
+        ar->link_ufd.fd = lfd;
+        ar->link_ufd.cb = link_event_cb;
+        uloop_fd_add(&ar->link_ufd, ULOOP_READ);
     }
 
-    syslog(LOG_INFO, "started instance '%s' dl=%s ul=%s ping_type=%s",
-           section, ar.cfg.dl_if, ar.cfg.ul_if,
-           ar.cfg.ping_type == 1 ? "ICMP-timestamp(13)" : "ICMP-echo(8)");
+    ubus_init(ar);
+
+    syslog(LOG_INFO, "darkmoon %s starting instance '%s'", DARKMOON_VERSION, section);
+    ar->startup_timer.cb = startup_cb;
+    ar->if_timer.cb = if_timer_cb;
+    if (c->startup_wait_us > 0)
+        syslog(LOG_INFO, "waiting %lld s before startup", (long long)(c->startup_wait_us / 1000000));
+    uloop_timeout_set(&ar->startup_timer, (int)(c->startup_wait_us / 1000));
 
     uloop_run();
+
+    syslog(LOG_INFO, "stopping instance '%s'", section);
+    stop_pingers(ar);
+    uloop_timeout_cancel(&ar->rate_timer);
+    uloop_timeout_cancel(&ar->health_timer);
+    uloop_timeout_cancel(&ar->if_timer);
+    uloop_timeout_cancel(&ar->startup_timer);
+    rate_monitor_close(&ar->rm);
+    qdisc_teardown(ar);
+    ubus_done();
+    if (ar->link_ufd.fd >= 0) {
+        uloop_fd_delete(&ar->link_ufd);
+        close(ar->link_ufd.fd);
+    }
     uloop_done();
-
-    /* ── Graceful shutdown ───────────────────────────────────── */
-    syslog(LOG_INFO, "shutting down instance '%s'", section);
-
-    uloop_timeout_cancel(&ar.rate_timer);
-    uloop_timeout_cancel(&ar.health_timer);
-    uloop_timeout_cancel(&ar.if_up_timer);
-    stop_pinger(&ar);
-
-    /* Remove status file so LuCI shows the service as stopped */
-    unlink("/var/run/darkmoon.json");
-
-err_teardown:
-    /*
-     * Remove all CAKE TC objects we created.
-     * This leaves the interfaces clean (no rate limiting) after exit.
-     */
-    cake_teardown(&ar);
-
-err_tc_close:
-    tc_nl_close(ar.tc_nl);
-    ar.tc_nl = NULL;
-
-    rate_monitor_cleanup(&ar.rm);
-
-err_free_windows:
-    free(ar.dl_delays);
-    free(ar.ul_delays);
-    free(ar.dl_owd_deltas_us);
-    free(ar.ul_owd_deltas_us);
-
+    tc_nl_close(ar->nl);
     closelog();
     return 0;
 }

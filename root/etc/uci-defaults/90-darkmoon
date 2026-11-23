@@ -1,0 +1,24 @@
+#!/bin/sh
+# First-install helper: if the shipped default upload interface ('wan') does
+# not exist on this device, point darkmoon at the WAN's real device instead.
+# Never touches an instance the user has already enabled.
+
+[ "$(uci -q get darkmoon.primary.enabled)" = "1" ] && exit 0
+[ "$(uci -q get darkmoon.primary.ul_if)" = "wan" ] || exit 0
+[ -e /sys/class/net/wan ] && exit 0
+
+. /lib/functions/network.sh
+
+dev=""
+case "$(uci -q get network.wan.proto)" in
+	pppoe|pppoa|pptp|l2tp|3g|ppp) dev="$(uci -q get network.wan.proto)-wan" ;;
+esac
+[ -n "$dev" ] || network_get_device dev wan
+[ -n "$dev" ] || dev="$(uci -q get network.wan.device)"
+[ -n "$dev" ] || dev="$(uci -q get network.wan.ifname)"
+
+if [ -n "$dev" ] && [ "$dev" != "wan" ]; then
+	uci set darkmoon.primary.ul_if="$dev"
+	uci commit darkmoon
+fi
+exit 0

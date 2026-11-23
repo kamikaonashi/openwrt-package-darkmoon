@@ -1,184 +1,135 @@
+# All values below are the built-in defaults. Add another
+# 'config darkmoon <name>' section per additional WAN.
+
 config darkmoon 'primary'
-    # ── Enable / disable ─────────────────────────────────────
-    option enabled '0'
+	option enabled '0'
 
-    # ── Interfaces ───────────────────────────────────────────
-    # dl_if: IFB interface for shaped ingress (created automatically at startup)
-    # ul_if: WAN-facing interface for egress shaping
-    option dl_if 'ifb-wan'
-    option ul_if 'wan'
-    option adjust_dl_shaper_rate '1'
-    option adjust_ul_shaper_rate '1'
+	# Interfaces
+	# ul_if: WAN device (e.g. wan, eth1, pppoe-wan, wwan0)
+	# dl_if: IFB that darkmoon creates for download shaping, or an existing
+	#        LAN-side device (e.g. br-lan) to shape download on its egress
+	option ul_if 'wan'
+	option dl_if 'ifb-wan'
 
-    # ── Shaper rates (kbps) ──────────────────────────────────
-    option min_dl_shaper_rate_kbps  '5000'
-    option base_dl_shaper_rate_kbps '20000'
-    option max_dl_shaper_rate_kbps  '80000'
-    option min_ul_shaper_rate_kbps  '5000'
-    option base_ul_shaper_rate_kbps '20000'
-    option max_ul_shaper_rate_kbps  '35000'
-    option connection_active_thr_kbps '2000'
+	# Shaper rates (kbit/s)
+	# base: typical rate when idle, min: lowest acceptable rate under
+	# bufferbloat, max: highest rate darkmoon may try (≈ plan speed)
+	option min_dl_shaper_rate_kbps  '5000'
+	option base_dl_shaper_rate_kbps '20000'
+	option max_dl_shaper_rate_kbps  '80000'
+	option min_ul_shaper_rate_kbps  '5000'
+	option base_ul_shaper_rate_kbps '20000'
+	option max_ul_shaper_rate_kbps  '35000'
+	# 0 = keep this direction fixed at its base rate
+	option adjust_dl_shaper_rate '1'
+	option adjust_ul_shaper_rate '1'
 
-    # ── Pinger ───────────────────────────────────────────────
-    option no_pingers '6'
-    option reflector_ping_interval_s '0.3'
+	# CAKE
+	# link_layer: raw ethernet ethernet-vlan docsis pppoe-ptm bridged-ptm
+	#   pppoe-llcsnap pppoe-vcmux pppoa-llc pppoa-vcmux bridged-llcsnap
+	#   bridged-vcmux ipoa-llcsnap ipoa-vcmux, or custom (uses cake_overhead,
+	#   cake_mpu and cake_atm)
+	option link_layer 'ethernet'
+	option cake_diffserv 'diffserv4'
+	option cake_dl_flow_mode 'dual-dsthost'
+	option cake_ul_flow_mode 'dual-srchost'
+	option cake_nat '1'
+	option cake_wash '1'
+	option cake_ack_filter '0'
+	option cake_split_gso '1'
+	option cake_rtt_ms '0'
+	option cake_memlimit_kb '0'
+	option cake_mq '0'
 
-    # First no_pingers entries are active; the rest are spares
-    # used to replace misbehaving reflectors.
-    list reflectors '1.1.1.1'
-    list reflectors '1.0.0.1'
-    list reflectors '8.8.8.8'
-    list reflectors '8.8.4.4'
-    list reflectors '9.9.9.9'
-    list reflectors '9.9.9.10'
-    list reflectors '94.140.14.15'
-    list reflectors '94.140.14.140'
-    list reflectors '208.67.220.220'
-    list reflectors '208.67.222.222'
+	# Pinger
+	# ping_type: echo (RTT/2) or timestamp (ICMP type 13, true one-way
+	# delay; needs reflectors that answer timestamp requests)
+	option ping_type 'echo'
+	option no_pingers '6'
+	option reflector_ping_interval_s '0.3'
+	option randomize_reflectors '1'
+	option bind_ping_to_ul_if '0'
+	# reflectors_file: one IPv4 per line; replaces the list below
+	option reflectors_file ''
+	list reflectors '1.1.1.1'
+	list reflectors '1.0.0.1'
+	list reflectors '8.8.8.8'
+	list reflectors '8.8.4.4'
+	list reflectors '9.9.9.9'
+	list reflectors '9.9.9.10'
+	list reflectors '9.9.9.11'
+	list reflectors '94.140.14.15'
+	list reflectors '94.140.14.140'
+	list reflectors '94.140.14.141'
+	list reflectors '94.140.15.15'
+	list reflectors '94.140.15.16'
+	list reflectors '64.6.65.6'
+	list reflectors '156.154.70.1'
+	list reflectors '156.154.70.2'
+	list reflectors '156.154.70.3'
+	list reflectors '156.154.70.4'
+	list reflectors '156.154.70.5'
+	list reflectors '156.154.71.1'
+	list reflectors '156.154.71.2'
+	list reflectors '156.154.71.3'
+	list reflectors '156.154.71.4'
+	list reflectors '156.154.71.5'
+	list reflectors '208.67.220.2'
+	list reflectors '208.67.220.123'
+	list reflectors '208.67.220.220'
+	list reflectors '208.67.222.2'
+	list reflectors '208.67.222.123'
+	list reflectors '185.228.168.9'
+	list reflectors '185.228.168.10'
 
-    # ── OWD thresholds (ms) ──────────────────────────────────
-    option dl_avg_owd_delta_max_adjust_up_thr_ms   '10.0'
-    option ul_avg_owd_delta_max_adjust_up_thr_ms   '10.0'
-    option dl_owd_delta_delay_thr_ms               '30.0'
-    option ul_owd_delta_delay_thr_ms               '30.0'
-    option dl_avg_owd_delta_max_adjust_down_thr_ms '60.0'
-    option ul_avg_owd_delta_max_adjust_down_thr_ms '60.0'
+	# Bufferbloat detection
+	option dl_owd_delta_delay_thr_ms               '30.0'
+	option ul_owd_delta_delay_thr_ms               '30.0'
+	option dl_avg_owd_delta_max_adjust_up_thr_ms   '10.0'
+	option ul_avg_owd_delta_max_adjust_up_thr_ms   '10.0'
+	option dl_avg_owd_delta_max_adjust_down_thr_ms '60.0'
+	option ul_avg_owd_delta_max_adjust_down_thr_ms '60.0'
+	option bufferbloat_detection_window '6'
+	option bufferbloat_detection_thr    '3'
+	option high_load_thr                '0.75'
+	option connection_active_thr_kbps   '2000'
 
-    # ── EWMA / baseline ──────────────────────────────────────
-    option alpha_baseline_increase '0.001'
-    option alpha_baseline_decrease '0.9'
-    option alpha_delta_ewma        '0.095'
+	# Rate adjustment
+	option shaper_rate_min_adjust_down_bufferbloat '0.99'
+	option shaper_rate_max_adjust_down_bufferbloat '0.75'
+	option shaper_rate_min_adjust_up_load_high     '1.0'
+	option shaper_rate_max_adjust_up_load_high     '1.04'
+	option shaper_rate_adjust_down_load_low        '0.99'
+	option shaper_rate_adjust_up_load_low          '1.01'
+	option bufferbloat_refractory_period_ms '300'
+	option decay_refractory_period_ms       '1000'
 
-    # ── Rate adjustment multipliers ──────────────────────────
-    option shaper_rate_min_adjust_down_bufferbloat '0.99'
-    option shaper_rate_max_adjust_down_bufferbloat '0.75'
-    option shaper_rate_min_adjust_up_load_high     '1.0'
-    option shaper_rate_max_adjust_up_load_high     '1.04'
-    option shaper_rate_adjust_down_load_low        '0.99'
-    option shaper_rate_adjust_up_load_low          '1.01'
+	# Baseline / EWMA
+	option alpha_baseline_increase '0.001'
+	option alpha_baseline_decrease '0.9'
+	option alpha_delta_ewma        '0.095'
 
-    # ── Bufferbloat detection ────────────────────────────────
-    option bufferbloat_detection_window '6'
-    option bufferbloat_detection_thr    '3'
-    option high_load_thr                '0.75'
-    option bufferbloat_refractory_period_ms '300'
-    option decay_refractory_period_ms       '1000'
+	# Reflector health
+	option reflector_health_check_interval_s        '1.0'
+	option reflector_response_deadline_s            '1.0'
+	option reflector_misbehaving_detection_window   '60'
+	option reflector_misbehaving_detection_thr      '3'
+	option reflector_replacement_interval_s         '3600'
+	option reflector_comparison_interval_s          '60'
+	option reflector_sum_owd_baselines_delta_thr_ms '20.0'
+	option reflector_owd_delta_ewma_delta_thr_ms    '10.0'
+	option retain_reflector_stats                   '1'
 
-    # ── Reflector health ─────────────────────────────────────
-    option reflector_health_check_interval_s         '1'
-    option reflector_response_deadline_s             '1'
-    option reflector_misbehaving_detection_window    '60'
-    option reflector_misbehaving_detection_thr       '3'
-    option reflector_replacement_interval_s          '3600'
-    option reflector_comparison_interval_s           '60'
-    option reflector_sum_owd_baselines_delta_thr_ms  '20.0'
-    option reflector_owd_delta_ewma_delta_thr_ms     '10.0'
+	# Idle / stall
+	option enable_sleep_function          '1'
+	option sustained_idle_sleep_thr_s     '60.0'
+	option min_shaper_rates_enforcement   '0'
+	option stall_detection_thr            '5'
+	option connection_stall_thr_kbps      '10'
+	option global_ping_response_timeout_s '10.0'
 
-    # ── Stall detection ──────────────────────────────────────
-    option stall_detection_thr           '5'
-    option connection_stall_thr_kbps     '10'
-    option global_ping_response_timeout_s '10.0'
-
-    # ── Misc ─────────────────────────────────────────────────
-    option enable_sleep_function              '1'
-    option sustained_idle_sleep_thr_s         '60.0'
-    option min_shaper_rates_enforcement       '0'
-    option startup_wait_s                     '0.0'
-    option monitor_achieved_rates_interval_ms '200'
-    option if_up_check_interval_s             '10.0'
-
-    # ── Pinger mode ─────────────────────────────────────────
-    # ping_type: ICMP packet type used for OWD measurement.
-    #
-    #   0 = ICMP Echo (type 8/0)  – default
-    #       Measures RTT; OWD estimated as RTT/2.
-    #       Works against any host that responds to ping.
-    #       Assumes symmetric path – underestimates OWD asymmetry.
-    #
-    #   1 = ICMP Timestamp (type 13/14)
-    #       Returns true per-direction OWD from reflector timestamps.
-    #       More accurate for asymmetric broadband (DSL, cable, DOCSIS).
-    #       Requires reflectors that support ICMP timestamp replies.
-    #       Recommended reflector list:
-    #         https://github.com/tievolu/timestamp-reflectors
-    option ping_type '0'
-
-    # reflectors_file: path to a plain-text file of reflector IP addresses,
-    # one per line (lines starting with '#' are ignored).
-    # When set, overrides the 'reflectors' list above.
-    # The daemon shuffles the list on each startup for reflector diversity.
-    # Leave blank to use the list above.
-    #
-    # Example:
-    #   option reflectors_file '/etc/darkmoon/timestamp-reflectors.txt'
-    option reflectors_file ''
-
-    # ── CAKE qdisc options ───────────────────────────────────
-    # These are applied when the daemon creates the CAKE qdiscs at startup.
-    # No sqm-scripts required; the daemon manages the full IFB+CAKE plumbing.
-
-    # overhead: per-packet byte overhead for rate accounting.
-    #   0  = none (Ethernet / plain PPPoE-PTM)
-    #   8  = PPPoE over PTM/VDSL2
-    #   18 = PPPoE over ATM/ADSL (LLC/SNAP)
-    option cake_overhead '0'
-
-    # mpu: minimum packet unit in bytes (0 = CAKE default, no padding)
-    option cake_mpu '0'
-
-    # nat: NAT-aware flow hashing — strongly recommended for home routers
-    #   1 = enabled (default), 0 = disabled
-    option cake_nat '1'
-
-    # wash: strip DSCP/ECN markings on egress (applied to UL only)
-    #   1 = enabled (default), 0 = disabled
-    option cake_wash '1'
-
-    # ack_filter: suppress redundant TCP ACKs to reclaim UL capacity
-    #   0 = off (default, safest)
-    #   1 = moderate filtering
-    #   2 = aggressive
-    option cake_ack_filter '0'
-
-    # diffserv: tin / traffic classification structure
-    #   1 = diffserv4  – 4 tins: bulk / best-effort / streaming / voice (default)
-    #   2 = diffserv8  – 8 tins mapped to CS0–CS7
-    #   3 = besteffort – single tin (no prioritisation)
-    #   4 = precedence – legacy IP Precedence field
-    option cake_diffserv '1'
-
-    # flow_mode: per-flow / per-host isolation
-    #   7 = triple (default) – isolates by src host, dst host, and 5-tuple flow
-    #   5 = dual-srchost     – src host + flow
-    #   6 = dual-dsthost     – dst host + flow
-    #   3 = hosts            – src+dst host pair only
-    #   4 = flows            – 5-tuple flow only
-    option cake_flow_mode '7'
-
-    # atm: ATM/PTM cell-size compensation
-    #   0 = none (default)
-    #   1 = ATM  – 48-byte cell rounding (ADSL)
-    #   2 = PTM  – 64-byte expansion (VDSL2 alternative to overhead 8)
-    option cake_atm '0'
-
-    # rtt_ms: CAKE AQM target RTT in milliseconds (0 = CAKE default = 100 ms)
-    option cake_rtt_ms '0'
-
-    # split_gso: split GSO super-packets before scheduling (recommended)
-    #   1 = enabled (default), 0 = disabled
-    option cake_split_gso '1'
-
-    # ── cake-mq (OpenWrt 25.12+) ─────────────────────────────
-    # cake_mq: use the multi-queue CAKE variant for improved multi-core
-    # throughput on routers with ≥2 CPU cores (Filogic, IPQ807x, etc.).
-    #
-    # Requirements:
-    #   - OpenWrt 25.12 or later
-    #   - kmod-sched-cake-mq package installed
-    #
-    # The daemon automatically falls back to standard CAKE if the
-    # kmod-sched-cake-mq module is not loaded.
-    #
-    #   0 = standard CAKE  (default; works on all hardware)
-    #   1 = cake-mq        (OpenWrt 25.12+, multi-core benefit)
-    option cake_mq '0'
+	# Misc
+	option startup_wait_s                     '0'
+	option monitor_achieved_rates_interval_ms '200'
+	option if_up_check_interval_s             '10.0'
+	option debug                              '0'

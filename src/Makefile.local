@@ -1,8 +1,9 @@
 CC      ?= gcc
-CFLAGS  ?= -O2 -pipe -Wall -Wextra -std=c11
-LDFLAGS ?= -lubox -luci
+CFLAGS  ?= -O2 -pipe
+CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter
+LDLIBS  += -lubus -lubox -luci
 
-SRCS = main.c config.c rate_monitor.c tc_netlink.c
+SRCS = main.c config.c icmp.c rate_monitor.c tc_netlink.c ubus.c
 OBJS = $(SRCS:.c=.o)
 BIN  = darkmoon
 
@@ -11,7 +12,7 @@ BIN  = darkmoon
 all: $(BIN)
 
 $(BIN): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -19,8 +20,9 @@ $(BIN): $(OBJS)
 clean:
 	rm -f $(OBJS) $(BIN)
 
-# Header dependencies
-main.o:         main.c config.h rate_monitor.h tc_netlink.h
-config.o:       config.c config.h tc_netlink.h
+main.o:         main.c autorate.h config.h icmp.h rate_monitor.h tc_netlink.h
+config.o:       config.c config.h
+icmp.o:         icmp.c icmp.h
 rate_monitor.o: rate_monitor.c rate_monitor.h
 tc_netlink.o:   tc_netlink.c tc_netlink.h
+ubus.o:         ubus.c autorate.h config.h
